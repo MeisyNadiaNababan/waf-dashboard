@@ -15,8 +15,7 @@ Chart.defaults.font.family = "'Inter',system-ui,sans-serif";
 Chart.defaults.color = TEXT_COLOR;
 
 function destroyChart(id){ if (CHARTS[id]){ CHARTS[id].destroy(); delete CHARTS[id]; } }
-function fmtNum(n){ return (n === null || n === undefined) ? '0' : NUM_FMT.format(n); }   // angka penuh, tanpa pembulatan
-// Dulu menyingkat (831K / 9.0K). Sekarang SELALU angka penuh, mis. 830.566
+function fmtNum(n){ return (n === null || n === undefined) ? '0' : NUM_FMT.format(n); }
 function fmtNumShort(n){ return fmtNum(n); }
 function trunc(s, max){ s = String(s ?? ''); return s.length > max ? s.slice(0,max)+'…' : s; }
 function hexA(hex, a){
@@ -192,7 +191,7 @@ function hBarChart(id, labels, data, options){
 }
 
 // ============================================================
-// 3b. VERTICAL PILL BAR (referensi gambar 4)
+// 3b. VERTICAL PILL BAR
 // ============================================================
 function vBarChart(id, labels, data, options){
   options = options || {};

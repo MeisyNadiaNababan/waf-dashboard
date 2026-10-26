@@ -12,24 +12,26 @@
 </head>
 <body>
 <div class="app">
-
-<!-- ============ SIDEBAR ============ -->
-<aside class="sidebar">
-  <div class="logo">W</div>
-  <nav>
-    <a href="#sec-overview" class="active" title="Overview"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg></a>
-    <a href="#sec-traffic" title="Traffic"><svg viewBox="0 0 24 24"><polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/></svg></a>
-    <a href="#sec-threats" title="Threats"><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg></a>
-    <a href="#sec-logs" title="Log"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="13" y2="16"/></svg></a>
-  </nav>
-</aside>
-
 <div class="main">
 <!-- ============ TOPBAR ============ -->
 <header class="topbar">
   <div class="tb-left">
     <h1>WAF Security Operations Center</h1>
-    <div class="tb-sub"><span class="filter-chip"><b>vs_name</b> /Common/vs_api-gateway.bpbatam.go.id</span><span class="range-info" id="rangeInfo">—</span><span class="range-info live" id="lastUpdate"></span></div>
+    <div class="tb-sub">
+      <div class="vs-name-card" id="vsNameCard">
+        <span class="vs-label">vs_name</span>
+        <span class="vs-value">/Common/vs_api-gateway.bpbatam.go.id</span>
+        <span class="vs-caret">▾</span>
+      </div>
+      <div class="range-info-card">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="16" rx="3"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="3" x2="8" y2="7"/><line x1="16" y1="3" x2="16" y2="7"/></svg>
+        <span id="rangeInfo">—</span>
+      </div>
+      <div class="update-status-card" id="lastUpdateCard">
+        <span class="pulse-dot" style="background:var(--ok)"></span>
+        <span id="lastUpdate">Memuat...</span>
+      </div>
+    </div>
   </div>
   <div class="tb-right">
     <div class="daterange" id="dateRangePicker">
@@ -61,7 +63,13 @@
         </div>
       </div>
     </div>
-    <div class="threat-badge" id="threatBadge"><span class="pulse-dot"></span><span id="threatLabel">MEMUAT...</span></div>
+
+    <!-- THREAT BADGE -->
+    <div class="threat-badge" id="threatBadge">
+      <span class="pulse-dot"></span>
+      <span id="threatLabel">MEMUAT...</span>
+    </div>
+
     <div class="live-clock" id="liveClock">--:--:--</div>
     <button id="btnAuto" class="btn-auto on" title="Segarkan otomatis tiap 5 menit">Auto 5m: ON</button>
     <button id="btnRefreshAll" class="btn-refresh">
@@ -72,18 +80,9 @@
 </header>
 
 <div id="loading" class="loading hidden"><div class="spinner"></div><div id="loadingText">Menarik data dari Kibana…</div></div>
+<div id="statusNotice" class="status-notice hidden"></div>
 
 <main class="content" id="sec-overview">
-
-  <!-- ALERT BANNER -->
-  <section class="alert-banner" id="alertTicker">
-    <div class="banner-left">
-      <div class="banner-badge" id="bannerBadge"><span class="banner-dot"></span><span id="bannerStatus">INFO</span></div>
-      <div class="banner-title" id="bannerTitle">Belum ada data</div>
-    </div>
-    <div class="banner-items" id="bannerItems"><span class="banner-placeholder">Klik "Tarik Data" untuk memuat data terbaru</span></div>
-  </section>
-
   <!-- KPI -->
   <section class="kpi-row">
     <div class="kpi">
@@ -115,15 +114,10 @@
   <section class="grid" id="sec-traffic">
 
     <!-- REQUEST RATE -->
-    <div class="card c8">
+    <div class="card c8 card-req-rate">
       <div class="card-head">
         <div><h3>Request Rate</h3><p>Tren volume request per jam berdasarkan kategori</p></div>
         <div class="card-actions">
-          <div class="filter-toggles" id="filterReqRate">
-            <label class="toggle-chip active" data-cat="Clean"><input type="checkbox" checked><span class="dot" style="background:#00e676"></span>Clean</label>
-            <label class="toggle-chip active" data-cat="Alerted"><input type="checkbox" checked><span class="dot" style="background:#ff9f43"></span>Alerted</label>
-            <label class="toggle-chip active" data-cat="Blocked"><input type="checkbox" checked><span class="dot" style="background:#ff4757"></span>Blocked</label>
-          </div>
           <button class="btn-see-data" data-see="reqrate">SEE DATA</button>
         </div>
       </div>
@@ -131,12 +125,22 @@
     </div>
 
     <!-- THREAT LEVEL -->
-    <div class="card c4">
-      <div class="card-head"><div><h3>Threat Level</h3><p>Skor berdasarkan blocked + alerted</p></div><button class="btn-see-data" data-see="threat">SEE DATA</button></div>
-      <div class="gauge-wrap"><canvas id="gaugeThreat"></canvas>
-        <div class="gauge-center"><div class="gauge-value" id="threatScore">--</div><div class="gauge-label" id="threatStatus">MEMUAT</div></div>
+    <div class="card c4 card-threat">
+      <div class="card-head">
+        <div>
+          <h3>Threat Level</h3>
+          <p>Intensitas aktivitas mencurigakan + serangan terblokir + lonjakan 24 jam</p>
+        </div>
+        <button class="btn-see-data" data-see="threat">SEE DATA</button>
       </div>
-      <div class="gauge-scale"><span>0 Aman</span><span>100 Kritis</span></div>
+      <div class="gauge-wrap"><canvas id="gaugeThreat"></canvas>
+        <div class="gauge-center">
+          <div class="gauge-value" id="threatScore">--</div>
+          <div class="gauge-label" id="threatStatus">MEMUAT</div>
+        </div>
+      </div>
+      <div class="gauge-scale"><span>0 Very Low</span><span>100 Critical</span></div>
+      <div class="threat-parts" id="threatParts"></div>
     </div>
 
     <!-- TRAFFIC COMPOSITION -->
@@ -147,10 +151,16 @@
 
     <!-- HEATMAP -->
     <div class="card c8">
-      <div class="card-head"><div><h3>Attack Heatmap</h3><p>Intensitas pelanggaran per jam × hari</p></div><button class="btn-see-data" data-see="heatmap">SEE DATA</button></div>
+      <div class="card-head"><div><h3>Attack Heatmap</h3><p>Jumlah request serangan per jam × hari (WIB)</p></div><button class="btn-see-data" data-see="heatmap">SEE DATA</button></div>
       <div class="heatmap-body">
         <div id="heatmapGrid" class="heatmap-grid"></div>
-        <div class="heatmap-legend"><span>Rendah</span><div class="heat-gradient"></div><span>Tinggi</span></div>
+        <div class="heatmap-legend">
+          <div class="heat-legend-labels">
+            <span>Low</span><span>Medium</span><span>High</span><span>Critical</span>
+          </div>
+          <div class="heat-gradient"></div>
+        </div>
+        <div class="heat-insights" id="heatInsights"></div>
       </div>
     </div>
 
@@ -180,19 +190,8 @@
       <div class="cb"><canvas id="chartRespDist"></canvas></div>
     </div>
 
-    <!-- SEVERITY -->
-    <div class="card c4" id="sec-threats">
-      <div class="card-head"><div><h3>Severity Breakdown</h3><p>Ancaman berdasarkan tingkat bahaya</p></div><button class="btn-see-data" data-see="severity">SEE DATA</button></div>
-      <div class="severity-list" id="severityList">
-        <div class="sev-item"><div class="sev-row"><span class="sev-name">Critical</span><span class="sev-val" id="sevCritical">0</span></div><span class="sev-bar"><i style="width:0%;background:linear-gradient(90deg,#ff4757,#ff7a8a)"></i></span></div>
-        <div class="sev-item"><div class="sev-row"><span class="sev-name">High</span><span class="sev-val" id="sevHigh">0</span></div><span class="sev-bar"><i style="width:0%;background:linear-gradient(90deg,#ff8c42,#ffb47a)"></i></span></div>
-        <div class="sev-item"><div class="sev-row"><span class="sev-name">Medium</span><span class="sev-val" id="sevMedium">0</span></div><span class="sev-bar"><i style="width:0%;background:linear-gradient(90deg,#fbbf24,#fde68a)"></i></span></div>
-        <div class="sev-item"><div class="sev-row"><span class="sev-name">Low</span><span class="sev-val" id="sevLow">0</span></div><span class="sev-bar"><i style="width:0%;background:linear-gradient(90deg,#00c875,#6ee7b7)"></i></span></div>
-      </div>
-    </div>
-
-    <!-- TOP ATTACKERS -->
-    <div class="card c4">
+    <!-- TOP ATTACKERS (Poin 2: Diperbesar c6) -->
+    <div class="card c6">
       <div class="card-head">
         <div><h3>Top Attackers</h3><p>IP dengan request tertinggi</p></div>
         <div class="card-actions"><button class="btn-filter" data-filter-target="ip">Filter IP</button><button class="btn-see-data" data-see="topip">SEE DATA</button></div>
@@ -201,20 +200,28 @@
         <div class="filter-panel-head"><span>Pilih IP:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpIPAll">All</button><button class="fp-mini-btn" id="fpIPNone">None</button></div></div>
         <div class="filter-panel-body" id="filterIPList"></div>
       </div>
-      <div class="cb"><canvas id="chartTopIP"></canvas></div>
+      <div class="cb flex-grow scrollable-chart"><canvas id="chartTopIP"></canvas></div>
     </div>
 
-    <!-- TOP VIOLATORS -->
-    <div class="card c4">
+    <!-- TOP VIOLATORS (Poin 2: Diperbesar c6) -->
+    <div class="card c6">
       <div class="card-head">
         <div><h3>Top Violators</h3><p>IP dengan pelanggaran terbanyak</p></div>
-        <div class="card-actions"><button class="btn-filter" data-filter-target="viol">Filter IP</button><button class="btn-see-data" data-see="violator">SEE DATA</button></div>
+        <div class="card-actions">
+          <button class="btn-filter" data-filter-target="viol">Filter IP</button>
+          <button class="btn-filter" data-filter-target="violtype">Filter Violation</button>
+          <button class="btn-see-data" data-see="violator">SEE DATA</button>
+        </div>
       </div>
       <div class="filter-panel hidden" id="filterViolPanel">
         <div class="filter-panel-head"><span>Pilih IP:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpViolAll">All</button><button class="fp-mini-btn" id="fpViolNone">None</button></div></div>
         <div class="filter-panel-body" id="filterViolList"></div>
       </div>
-      <div class="cb"><canvas id="chartViolator"></canvas></div>
+      <div class="filter-panel hidden" id="filterViolTypePanel">
+        <div class="filter-panel-head"><span>Pilih Jenis Violation:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpViolTypeAll">All</button><button class="fp-mini-btn" id="fpViolTypeNone">None</button></div></div>
+        <div class="filter-panel-body" id="filterViolTypeList"></div>
+      </div>
+      <div class="cb flex-grow"><canvas id="chartViolator"></canvas></div>
     </div>
 
     <!-- VIOLATION CATEGORIES -->
@@ -227,7 +234,7 @@
         <div class="filter-panel-head"><span>Pilih jenis pelanggaran:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpViolDistAll">All</button><button class="fp-mini-btn" id="fpViolDistNone">None</button></div></div>
         <div class="filter-panel-body" id="filterViolDistList"></div>
       </div>
-      <div class="cb tall"><canvas id="chartViol"></canvas></div>
+      <div class="cb flex-grow"><canvas id="chartViol"></canvas></div>
     </div>
 
     <!-- ATTACK SIGNATURES -->
@@ -240,11 +247,11 @@
         <div class="filter-panel-head"><span>Pilih Sig ID:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpSigAll">All</button><button class="fp-mini-btn" id="fpSigNone">None</button></div></div>
         <div class="filter-panel-body" id="filterSigList"></div>
       </div>
-      <div class="cb tall"><canvas id="chartSig"></canvas></div>
+      <div class="cb flex-grow"><canvas id="chartSig"></canvas></div>
     </div>
 
     <!-- ENDPOINT -->
-    <div class="card c12">
+    <div class="card c12 card-endpoint">
       <div class="card-head">
         <div><h3>Endpoint Paling Sering Diserang</h3><p>URI dengan request tertinggi</p></div>
         <div class="card-actions"><button class="btn-filter" data-filter-target="url">Filter URI</button><button class="btn-see-data" data-see="topurl">SEE DATA</button></div>
@@ -253,18 +260,18 @@
         <div class="filter-panel-head"><span>Pilih URI:</span><div class="filter-panel-actions"><button class="fp-mini-btn" id="fpURLAll">All</button><button class="fp-mini-btn" id="fpURLNone">None</button></div></div>
         <div class="filter-panel-body" id="filterURLList"></div>
       </div>
-      <div class="cb tall"><canvas id="chartTopURL"></canvas></div>
+      <div class="cb flex-grow endpoint-chart-body"><canvas id="chartTopURL"></canvas></div>
     </div>
 
     <!-- LOG -->
     <div class="card c12" id="sec-logs">
       <div class="card-head">
-        <div><h3>Live Log Stream <span class="muted" id="reqCount">(– documents)</span></h3><p>Contoh 2000 request terbaru dari Elasticsearch</p></div>
+        <div><h3>Live Log Stream <span class="muted" id="reqCount">(– documents)</span></h3><p id="logMeta">2000 request terbaru dari Elasticsearch · urut dari yang paling baru</p></div>
         <button class="btn-secondary" id="btnLoadRaw">Tarik Raw Log</button>
       </div>
       <div class="table-scroll">
         <table class="data-table" id="tblRaw">
-          <thead><tr><th>DATE_TIME</th><th>IP_CLIENT</th><th>SOURCE_IP</th><th>HOST_IP</th><th>METHOD</th><th>X_FORWARDED_FOR</th><th>DEST_PORT</th><th>URI</th><th>RESPONSE_CODE</th><th>STATUS</th></tr></thead>
+          <thead><tr><th>TIMESTAMP</th><th>IP_CLIENT</th><th>SOURCE_IP</th><th>HOST_IP</th><th>METHOD</th><th>X_FORWARDED_FOR</th><th>DEST_PORT</th><th>URI</th><th>RESPONSE_CODE</th><th>STATUS</th></tr></thead>
           <tbody><tr><td colspan="10" class="empty">Klik "Tarik Raw Log" untuk memuat data.</td></tr></tbody>
         </table>
       </div>

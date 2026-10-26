@@ -1,40 +1,25 @@
 // ============================================================
-// WAF SOC DASHBOARD - APP LOGIC (v7 - Modern Bento UI)
+// WAF SOC DASHBOARD - APP LOGIC (v10)
 // ============================================================
 
-const API = location.origin.includes('localhost') ? 'http://localhost:5000' : '';
+const API = '';
 const STATE = {};
 
 if (typeof ChartDataLabels !== 'undefined'){
   Chart.register(ChartDataLabels);
 }
 
-// ============================================================
-// DATE RANGE STATE
-// ============================================================
 const DR = {
-  mode: 'quick',
-  quickVal: 'last-8M',
-  label: 'Last 8 months',
-  start: null,
-  end: null,
-  unit: 'months',
-  num: 8,
-  rel: null,          // {num, unit} untuk 'Last N unit' (dihitung ulang tiap tarik data)
+  mode: 'quick', quickVal: 'last-8M', label: 'Last 8 months',
+  start: null, end: null, unit: 'months', num: 8, rel: null,
 };
 let REFRESHING = false;
-const AUTO = { on: true, ms: 5 * 60 * 1000, timer: null };
+const AUTO = { on: true, ms: 5 * 60 * 1000, timer: null, rawMs: 60 * 1000, rawTimer: null };
 
-// Filter state per-chart
 const FILTERS = {
   reqRate:  { Clean: true, Alerted: true, Blocked: true },
-  resp:     new Set(),   // HTTP Response Trend
-  respdist: new Set(),   // Status Code Distribution
-  ip:       new Set(),   // Top Attackers
-  viol:     new Set(),   // Top Violators
-  sig:      new Set(),   // Attack Signatures
-  violdist: new Set(),   // Violation Categories
-  url:      new Set(),   // Endpoint
+  resp: new Set(), respdist: new Set(), ip: new Set(), viol: new Set(),
+  sig: new Set(), violdist: new Set(), url: new Set(), violtype: new Set(),
 };
 
 const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
@@ -207,6 +192,7 @@ function startClock(){
   const tick = ()=>{
     const d = new Date();
     el.textContent = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+    if (d.getSeconds() % 10 === 0 && typeof updateLogMeta === 'function') updateLogMeta();
   };
   tick();
   setInterval(tick, 1000);
@@ -220,10 +206,24 @@ function setLoading(on, text='Menarik data dari Kibana…'){
   document.getElementById('loading').classList.toggle('hidden', !on);
 }
 
-async function fetchData(type){
+function liveRange(){
+  if (DR.mode === 'quick' && DR.quickVal){
+    const r = computeFromQuick(DR.quickVal);
+    return { start: r.start, end: r.end };
+  }
+  if (DR.rel){
+    const now = new Date();
+    return { start: shiftDate(now, DR.rel.num, DR.rel.unit), end: now };
+  }
+  return { start: DR.start, end: DR.end };
+}
+
+async function fetchData(type, range){
+  const r = range || { start: DR.start, end: DR.end };
   const params = new URLSearchParams({
-    start_iso: toISO(DR.start),
-    end_iso:   toISO(DR.end),
+    start_iso: toISO(r.start),
+    end_iso:   toISO(r.end),
+    _t: Date.now(),
   });
   const url = `${API}/api/refresh/${type}?${params}`;
   const res = await fetch(url, {method:'POST', cache:'no-store'});
@@ -236,39 +236,244 @@ async function fetchData(type){
 }
 
 // ============================================================
-// POSTURE
+// ANALISIS SERANGAN
+// ============================================================
+const SEV_KEYS = ['Critical','High','Medium','Low','Unclassified'];
+const SEV_CLASS = { Critical:'danger', High:'danger', Medium:'warn', Low:'safe', Unclassified:'' };
+const SEV_BADGE = { Critical:'badge-danger', High:'badge-danger', Medium:'badge-warn', Low:'badge-safe', Unclassified:'' };
+
+const THREAT_COLORS = {
+  'VERY LOW':'#00e676', 'LOW':'#a8d84a', 'MEDIUM':'#ffd54f', 'HIGH':'#ff9f43', 'CRITICAL':'#ff4757'
+};
+const THREAT_CLASS = {
+  'VERY LOW':'', 'LOW':'', 'MEDIUM':'warning', 'HIGH':'warning', 'CRITICAL':'danger'
+};
+const THREAT_WEIGHT_ALERTED = 0.40;
+const THREAT_WEIGHT_BLOCKED = 0.40;
+const THREAT_WEIGHT_SPIKE   = 0.20;
+const ALERTED_FULL_RATE = 4.0;
+const BLOCKED_FULL_RATE = 2.0;
+const SPIKE_FULL_RATIO  = 3.0;
+const THREAT_TREND_MIN_EVENTS = 50;
+
+function threatKategori(score){
+  if (score < 20)  return ['VERY LOW','#00e676'];
+  if (score < 40)  return ['LOW','#a8d84a'];
+  if (score < 60)  return ['MEDIUM','#ffd54f'];
+  if (score < 80)  return ['HIGH','#ff9f43'];
+  return ['CRITICAL','#ff4757'];
+}
+
+const DAY_SHORT = ['Sen','Sel','Rab','Kam','Jum','Sab','Min'];
+const DAY_FULL  = ['Senin','Selasa','Rabu','Kamis','Jumat','Sabtu','Minggu'];
+
+const SEV_RULES_CLIENT = [
+  { sev:'Low', keys:['cookie not rfc','failed to convert character','length','illegal url length','n/a'] },
+  { sev:'Critical', keys:['attack signature','threat campaign','brute force','csrf','ssrf','malicious','backdoor','shell','sql injection','command execution','remote code','rce','deserialization'] },
+  { sev:'High', keys:['evasion technique','illegal file type','illegal meta character','illegal url','illegal parameter','illegal header','illegal method','data guard','information leakage','web scraping','bot','disallowed','access from','path traversal','directory','xss','cross site','ldap','xml external','xxe'] },
+  { sev:'Medium', keys:['http protocol compliance','malformed','illegal repeated','mandatory','illegal query string','illegal http status','request content type','cookies'] },
+];
+const SEV_RANK_CLIENT = { Critical:0, High:1, Medium:2, Low:3, Unclassified:4 };
+
+function classifyViolationClient(name){
+  let best = null;
+  String(name || '').split(/[,;|]/).forEach(part=>{
+    const p = part.trim().toLowerCase();
+    if (!p) return;
+    for (const r of SEV_RULES_CLIENT){
+      if (r.keys.some(k => p.includes(k))){
+        if (best === null || SEV_RANK_CLIENT[r.sev] < SEV_RANK_CLIENT[best]) best = r.sev;
+        break;
+      }
+    }
+  });
+  return best || 'Unclassified';
+}
+
+function buildFallbackAttackAnalysis(){
+  const rd = STATE.request_distribution;
+  const viol = STATE.violations;
+  const tvi = STATE.top_violator_ip;
+
+  if (!rd && !viol) return null;
+
+  const grand = rd ? (rd.grand_total || 0) : 0;
+  const alerted = rd ? ((rd.totals_by_category||{}).Alerted || 0) : 0;
+  const blocked = rd ? ((rd.totals_by_category||{}).Blocked || 0) : 0;
+  const attack = alerted + blocked;
+
+  const hourMap = {};
+  if (rd && rd.hourly){
+    rd.hourly.forEach(r=>{
+      if (r.category === 'Clean') return;
+      const k = r.period + '|' + r.hour;
+      hourMap[k] = (hourMap[k] || 0) + r.request_count;
+    });
+  }
+
+  const sev = { Critical:0, High:0, Medium:0, Low:0, Unclassified:0 };
+  const violList = [];
+  if (viol && viol.top){
+    viol.top.forEach(v=>{
+      const cls = classifyViolationClient(v.violation);
+      sev[cls] = (sev[cls] || 0) + v.violation_count;
+      violList.push({ violation: v.violation, severity: cls, count: v.violation_count });
+    });
+  }
+  const classified = sev.Critical + sev.High + sev.Medium + sev.Low;
+  sev.Unclassified = Math.max(0, attack - classified);
+
+  const total = Math.max(grand, 1);
+  const alertedRate = (alerted / total) * 100;
+  const blockedRate = (blocked / total) * 100;
+  const alertedScore = Math.min(100, (alertedRate / ALERTED_FULL_RATE) * 100);
+  const blockedScore = Math.min(100, (blockedRate / BLOCKED_FULL_RATE) * 100);
+
+  let last24 = 0, spikeScore = 0, spikeRatio = 0, detailSpike = '';
+  const hourlySusp = [];
+  if (tvi && tvi.hourly){
+    tvi.hourly.forEach(r=>{
+      hourlySusp.push({ period: r.period, hour: r.hour, count: r.violation_count });
+    });
+  }
+  const now = new Date();
+  const cutoffMs = now.getTime() - 24*3600*1000;
+  let earlierTotal = 0, earlierMinMs = now.getTime();
+  hourlySusp.forEach(r=>{
+    const [dd,mm,yyyy] = r.period.split('-');
+    const hh = parseInt(r.hour.split(':')[0],10);
+    const t = new Date(parseInt(yyyy,10), parseInt(mm,10)-1, parseInt(dd,10), hh).getTime();
+    if (t >= cutoffMs) last24 += r.count;
+    else { earlierTotal += r.count; if (t < earlierMinMs) earlierMinMs = t; }
+  });
+  const spanDays = Math.max((now.getTime() - earlierMinMs) / 86400000, 1);
+  if (last24 >= THREAT_TREND_MIN_EVENTS){
+    const baseDaily = earlierTotal / Math.max(spanDays - 1, 1);
+    spikeRatio = baseDaily > 0 ? last24 / baseDaily : SPIKE_FULL_RATIO;
+    spikeScore = Math.min(100, (spikeRatio / SPIKE_FULL_RATIO) * 100);
+    detailSpike = `24 jam terakhir: ${fmtNum(last24)} aktivitas vs baseline harian ${Math.round(baseDaily)} (${spikeRatio.toFixed(2)}x)`;
+  } else {
+    detailSpike = `24 jam terakhir: ${fmtNum(last24)} aktivitas (di bawah ambang ${THREAT_TREND_MIN_EVENTS}, dianggap normal)`;
+  }
+
+  const score = Math.round(
+    alertedScore * THREAT_WEIGHT_ALERTED +
+    blockedScore * THREAT_WEIGHT_BLOCKED +
+    spikeScore   * THREAT_WEIGHT_SPIKE
+  );
+  const [status, color] = threatKategori(score);
+
+  return {
+    _fallback: true,
+    range: rd ? rd.range : {start:null,end:null},
+    grand_total: grand,
+    attack_total: attack,
+    attack_alerted: alerted,
+    attack_blocked: blocked,
+    hourly: Object.keys(hourMap).map(k=>{
+      const [period, hour] = k.split('|');
+      return { period, hour, count: hourMap[k] };
+    }),
+    severity: sev,
+    violations: violList,
+    unclassified: violList.filter(v => v.severity === 'Unclassified').slice(0,10),
+    threat: {
+      score, status, color,
+      alerted_rate_pct: alertedRate,
+      blocked_rate_pct: blockedRate,
+      spike_ratio: spikeRatio,
+      last24_events: last24,
+      components: [
+        { key:'alerted', label:`Alerted Rate (bobot ${Math.round(THREAT_WEIGHT_ALERTED*100)}%)`,
+          points: Math.round(alertedScore * THREAT_WEIGHT_ALERTED * 10)/10,
+          max: Math.round(THREAT_WEIGHT_ALERTED*100),
+          detail: `${fmtNum(alerted)} dari ${fmtNum(total)} request ditandai Alerted (${alertedRate.toFixed(2)}%) · skor komponen ${alertedScore.toFixed(1)}/100 (poin penuh di ${ALERTED_FULL_RATE}%)` },
+        { key:'blocked', label:`Blocked Rate (bobot ${Math.round(THREAT_WEIGHT_BLOCKED*100)}%)`,
+          points: Math.round(blockedScore * THREAT_WEIGHT_BLOCKED * 10)/10,
+          max: Math.round(THREAT_WEIGHT_BLOCKED*100),
+          detail: `${fmtNum(blocked)} dari ${fmtNum(total)} request diblokir WAF (${blockedRate.toFixed(2)}%) · skor komponen ${blockedScore.toFixed(1)}/100 (poin penuh di ${BLOCKED_FULL_RATE}%)` },
+        { key:'spike', label:`Lonjakan 24 Jam (bobot ${Math.round(THREAT_WEIGHT_SPIKE*100)}%)`,
+          points: Math.round(spikeScore * THREAT_WEIGHT_SPIKE * 10)/10,
+          max: Math.round(THREAT_WEIGHT_SPIKE*100),
+          detail: detailSpike },
+      ],
+    },
+    warnings: ['Data dihitung di frontend (fallback). Ganti backend ke v10-threat-weighted untuk hasil paling akurat.'],
+  };
+}
+
+function ensureAttackAnalysis(){
+  if (STATE.attack_analysis) return;
+  const fb = buildFallbackAttackAnalysis();
+  if (fb) STATE.attack_analysis = fb;
+}
+
+function fmtPct(v, total, dec){
+  if (!total) return '0%';
+  return ((v / total) * 100).toFixed(dec === undefined ? 1 : dec).replace('.', ',') + '%';
+}
+
+// ============================================================
+// THREAT LEVEL (Poin 3: Diringkas)
 // ============================================================
 function computeThreatLevel(){
-  const d = STATE.request_distribution;
-  if (!d) return {score:0, status:'TIDAK ADA DATA', color:'#7a8aa3', class:'', blocked:0, alerted:0, clean:0, total:0};
-  const total = d.grand_total || 1;
-  const t = d.totals_by_category || {};
-  const blocked = t.Blocked || 0;
-  const alerted = t.Alerted || 0;
-  const clean = t.Clean || 0;
-  const blockedPct = (blocked / total) * 100;
-  const alertedPct = (alerted / total) * 100;
-  let score = Math.min(100, Math.round(blockedPct * 10 + alertedPct * 1.5));
-  let status, color, cls;
-  if (score < 15){ status='AMAN'; color='#00e676'; cls=''; }
-  else if (score < 35){ status='WASPADA'; color='#ffd54f'; cls='warning'; }
-  else if (score < 60){ status='SIAGA'; color='#ff9f43'; cls='warning'; }
-  else { status='KRITIS'; color='#ff4757'; cls='danger'; }
-  return {score, status, color, cls, blocked, alerted, clean, total: d.grand_total};
+  const a = STATE.attack_analysis;
+  if (!a || !a.threat){
+    return {available:false, score:0, status:'TIDAK ADA DATA', color:'#7a8aa3', cls:'',
+            components:[], total:0, attack:0, alerted:0, blocked:0,
+            alertedRate:0, blockedRate:0, last24:0};
+  }
+  const th = a.threat;
+  return {
+    available:true, score: th.score, status: th.status,
+    color: th.color || THREAT_COLORS[th.status] || '#7a8aa3',
+    cls: THREAT_CLASS[th.status] || '',
+    components: th.components || [],
+    total: a.grand_total || 0, attack: a.attack_total || 0,
+    alerted: a.attack_alerted || 0,
+    blocked: a.attack_blocked || 0,
+    alertedRate: th.alerted_rate_pct || 0,
+    blockedRate: th.blocked_rate_pct || 0,
+    last24: th.last24_events || 0,
+  };
 }
 
 function renderPosture(){
+  ensureAttackAnalysis();
   const t = computeThreatLevel();
   const badge = document.getElementById('threatBadge');
   badge.className = 'threat-badge ' + t.cls;
   document.getElementById('threatLabel').textContent = t.status;
   gaugeChart('gaugeThreat', t.score, 100, t.status, t.color);
   const scoreEl = document.getElementById('threatScore');
-  scoreEl.textContent = t.score;
+  scoreEl.textContent = t.available ? t.score : '--';
   scoreEl.style.color = t.color;
   const statusEl = document.getElementById('threatStatus');
   statusEl.textContent = t.status;
   statusEl.style.color = t.color;
+
+  const parts = document.getElementById('threatParts');
+  if (parts && !t.available){
+    parts.innerHTML = '<div class="pending-note">Menunggu data analisis serangan dari backend.</div>';
+  } else if (parts){
+    const info = `<div class="tp-info">
+      <b>${fmtNum(t.alerted)} Alerted</b> · <b>${fmtNum(t.blocked)} Blocked</b><br>
+      <span class="tp-muted">24 jam terakhir: ${t.last24 > 0
+        ? fmtNum(t.last24) + ' aktivitas mencurigakan'
+        : 'tidak terdapat lonjakan aktivitas serangan'}</span>
+    </div>`;
+    
+    // Menghilangkan teks detail panjang di bawah bar, diganti tooltip (title)
+    parts.innerHTML = info + t.components.map(c=>{
+      const w = c.max ? Math.min(100, (c.points / c.max) * 100) : 0;
+      return `<div class="tp-row" title="${escapeHtml(c.detail)}">
+        <div class="tp-top"><span class="tp-name">${escapeHtml(c.label)}</span>
+          <span class="tp-pts">${String(c.points).replace('.', ',')} <small>/ ${c.max}</small></span></div>
+        <span class="tp-bar"><i style="width:${w}%;background:${t.color}"></i></span>
+      </div>`;
+    }).join('');
+  }
+
   const d = STATE.request_distribution;
   if (d){
     document.getElementById('statTotal').textContent = fmtNum(d.grand_total);
@@ -280,158 +485,98 @@ function renderPosture(){
 }
 
 // ============================================================
-// SEVERITY
+// ATTACK HEATMAP
 // ============================================================
-const SEVERITY_MAP = {
-  'Attack signature detected': 'Critical',
-  'Threat Campaign detected': 'Critical',
-  'Illegal file type': 'High',
-  'Evasion technique detected': 'High',
-  'HTTP protocol compliance failed': 'Medium',
-  'Cookie not RFC-compliant': 'Low',
-  'Failed to convert character': 'Low',
-  'Malformed XML data': 'Medium',
-  'Malformed JSON data': 'Medium',
-  'Illegal URL length': 'Low',
-};
-
-function renderSeverity(){
-  const d = STATE.violations;
-  if (!d || !d.top) return;
-  const buckets = {Critical:0, High:0, Medium:0, Low:0};
-  d.top.forEach(v=>{
-    const sev = SEVERITY_MAP[v.violation] || 'Medium';
-    buckets[sev] += v.violation_count;
-  });
-  const max = Math.max(...Object.values(buckets), 1);
-  document.getElementById('sevCritical').textContent = fmtNum(buckets.Critical);
-  document.getElementById('sevHigh').textContent = fmtNum(buckets.High);
-  document.getElementById('sevMedium').textContent = fmtNum(buckets.Medium);
-  document.getElementById('sevLow').textContent = fmtNum(buckets.Low);
-  const bars = {
-    Critical: document.querySelector('#severityList .sev-item:nth-child(1) .sev-bar i'),
-    High:     document.querySelector('#severityList .sev-item:nth-child(2) .sev-bar i'),
-    Medium:   document.querySelector('#severityList .sev-item:nth-child(3) .sev-bar i'),
-    Low:      document.querySelector('#severityList .sev-item:nth-child(4) .sev-bar i'),
-  };
-  Object.keys(bars).forEach(k=>{
-    if (bars[k]) bars[k].style.width = ((buckets[k] / max) * 100) + '%';
-  });
-}
-
-// ============================================================
-// ALERT BANNER
-// ============================================================
-function renderBanner(){
-  const v = STATE.violations;
-  const s = STATE.top_signatures;
-  const ip = STATE.top_violator_ip;
-  const t = computeThreatLevel();
-  const banner = document.getElementById('alertTicker');
-  const badge = document.getElementById('bannerBadge');
-  const status = document.getElementById('bannerStatus');
-  const title = document.getElementById('bannerTitle');
-  const items = document.getElementById('bannerItems');
-
-  if (!v && !s && !ip){
-    banner.className = 'alert-banner';
-    badge.className = 'banner-badge';
-    status.textContent = 'INFO';
-    title.textContent = 'Belum ada data';
-    items.innerHTML = `<span class="banner-placeholder">Klik "Tarik Data" untuk memuat data terbaru</span>`;
-    return;
-  }
-
-  if (t.cls === 'danger'){
-    banner.className = 'alert-banner danger';
-    badge.className = 'banner-badge danger';
-    status.textContent = 'KRITIS';
-  } else if (t.cls === 'warning'){
-    banner.className = 'alert-banner has-alert';
-    badge.className = 'banner-badge warn';
-    status.textContent = 'WASPADA';
-  } else {
-    banner.className = 'alert-banner ok';
-    badge.className = 'banner-badge ok';
-    status.textContent = 'AMAN';
-  }
-
-  title.textContent = `Status: ${t.status}`;
-  const chips = [];
-  if (ip && ip.top_ips && ip.top_ips[0]){
-    const top = ip.top_ips[0];
-    chips.push(`<span class="banner-chip danger">🎯 Top Attacker <b>${top.ip_client}</b> · <b>${fmtNum(top.total_request_ip)}</b></span>`);
-  }
-  if (v && v.top && v.top[0]){
-    chips.push(`<span class="banner-chip warn">⚠ ${v.top[0].violation} <b>${fmtNum(v.top[0].violation_count)}</b></span>`);
-  }
-  if (s && s.top && s.top[0]){
-    chips.push(`<span class="banner-chip">🛡 Sig ID <b>${s.top[0].sig_id}</b> · <b>${fmtNum(s.top[0].request_count)}</b></span>`);
-  }
-  if (chips.length === 0){
-    items.innerHTML = `<span class="banner-placeholder">Tidak ada ancaman signifikan pada periode ini</span>`;
-  } else {
-    items.innerHTML = chips.join('');
-  }
-}
-
-// ============================================================
-// HEATMAP
-// ============================================================
-function renderHeatmap(){
-  const d = STATE.top_violator_ip;
-  const grid = document.getElementById('heatmapGrid');
-  if (!grid) return;
-  const bucket = Array.from({length: 7}, ()=> new Array(24).fill(0));
-  let maxVal = 0;
-  if (d && d.hourly){
-    d.hourly.forEach(r=>{
+function buildHeatBuckets(){
+  const a = STATE.attack_analysis;
+  const bucket = Array.from({length: 7}, () => new Array(24).fill(0));
+  let total = 0;
+  if (a && a.hourly){
+    a.hourly.forEach(r=>{
       const [dd, mm, yyyy] = r.period.split('-');
-      const dateObj = new Date(parseInt(yyyy), parseInt(mm)-1, parseInt(dd));
-      let dow = (dateObj.getDay() + 6) % 7;
+      const dow = (new Date(parseInt(yyyy,10), parseInt(mm,10)-1, parseInt(dd,10)).getDay() + 6) % 7;
       const hh = parseInt(r.hour.split(':')[0], 10);
-      bucket[dow][hh] += r.violation_count;
-      if (bucket[dow][hh] > maxVal) maxVal = bucket[dow][hh];
+      bucket[dow][hh] += r.count;
+      total += r.count;
     });
   }
-  if (maxVal === 0) maxVal = 1;
-  const DAY_NAMES_LOCAL = ['Sen','Sel','Rab','Kam','Jum','Sab','Min'];
-  let html = `<div></div>`;
-  for (let h=0; h<24; h++){
-    html += `<div class="heatmap-hour">${pad2(h)}</div>`;
+  return {bucket, total};
+}
+
+function renderHeatmap(){
+  ensureAttackAnalysis();
+  const grid = document.getElementById('heatmapGrid');
+  if (!grid) return;
+  if (!STATE.attack_analysis){
+    grid.innerHTML = '';
+    const i0 = document.getElementById('heatInsights');
+    if (i0) i0.innerHTML = '<div class="pending-note">Menunggu data analisis serangan.</div>';
+    return;
   }
-  for (let day=0; day<7; day++){
-    html += `<div class="heatmap-label">${DAY_NAMES_LOCAL[day]}</div>`;
+  const {bucket, total} = buildHeatBuckets();
+
+  let maxVal = 0, peak = {d:0, h:0};
+  const dayTot = new Array(7).fill(0), hourTot = new Array(24).fill(0);
+  for (let d=0; d<7; d++) for (let h=0; h<24; h++){
+    const v = bucket[d][h];
+    dayTot[d] += v; hourTot[h] += v;
+    if (v > maxVal){ maxVal = v; peak = {d, h}; }
+  }
+
+  let html = `<div></div>`;
+  for (let h=0; h<24; h++) html += `<div class="heatmap-hour">${pad2(h)}</div>`;
+  
+  for (let d=0; d<7; d++){
+    html += `<div class="heatmap-label">${DAY_SHORT[d]}</div>`;
     for (let h=0; h<24; h++){
-      const val = bucket[day][h];
-      const ratio = val / maxVal;
+      const val = bucket[d][h];
+      const ratio = maxVal ? (val / maxVal) : 0; 
+      
       let color = 'rgba(255,255,255,.04)';
-      if (ratio > 0){
-        const hue = 260 - ratio * 250;   // ungu -> cyan -> kuning -> merah
-        color = `hsla(${hue},90%,${48 + ratio*8}%,${0.35 + ratio*0.65})`;
+      if (val > 0){
+        if (ratio <= 0.25) {
+          const op = 0.4 + (ratio/0.25)*0.6;
+          color = `rgba(0, 230, 118, ${op})`; // Low: Hijau
+        } else if (ratio <= 0.5) {
+          color = `rgba(255, 213, 79, 0.9)`; // Medium: Kuning
+        } else if (ratio <= 0.75) {
+          color = `rgba(255, 159, 67, 0.9)`; // High: Oranye
+        } else {
+          color = `rgba(255, 71, 87, 1)`; // Critical: Merah
+        }
       }
-      html += `<div class="heatmap-cell" style="background:${color}" title="${DAY_NAMES_LOCAL[day]} ${pad2(h)}: ${fmtNum(val)} events"></div>`;
+      html += `<div class="heatmap-cell" style="background:${color}" title="${DAY_FULL[d]} ${pad2(h)}:00–${pad2(h)}:59 WIB · ${fmtNum(val)} serangan"></div>`;
     }
   }
   grid.innerHTML = html;
+
+  const minEl = document.getElementById('heatMin'), maxEl = document.getElementById('heatMax');
+  if (minEl) minEl.textContent = '0';
+  if (maxEl) maxEl.textContent = fmtNum(maxVal);
+
+  const ins = document.getElementById('heatInsights');
+  if (!ins) return;
+  if (!total){
+    ins.innerHTML = `<div class="heat-ins"><span>Info</span><b>Tidak ada serangan</b><em>pada periode ini</em></div>`;
+    return;
+  }
+  const topDay  = dayTot.indexOf(Math.max(...dayTot));
+  const topHour = hourTot.indexOf(Math.max(...hourTot));
+  let off = 0; for (let h=0; h<24; h++) if (h >= 18 || h < 6) off += hourTot[h];
+  ins.innerHTML = `
+    <div class="heat-ins"><span>Total</span><b>${fmtNum(total)}</b><em>request</em></div>
+    <div class="heat-ins"><span>Puncak</span><b>${DAY_SHORT[peak.d]} ${pad2(peak.h)}:00</b><em>${fmtNum(maxVal)} serangan</em></div>
+    <div class="heat-ins"><span>Hari</span><b>${DAY_FULL[topDay]}</b><em>${fmtPct(dayTot[topDay], total)}</em></div>
+    <div class="heat-ins"><span>Jam</span><b>${pad2(topHour)}:00</b><em>${fmtPct(hourTot[topHour], total)}</em></div>
+    <div class="heat-ins"><span>Off-Hours</span><b>${fmtPct(off, total)}</b><em>18:00–05:59</em></div>`;
 }
 
 // ============================================================
 // PALET WARNA
 // ============================================================
-const COLORS_TOP_IP = [
-  '#ff4757','#ff6348','#ff7f50','#ff9f43','#ffa726',
-  '#ffd54f','#a8d84a','#66bb6a','#26c6da','#54a0ff',
-];
-const COLORS_TOP_URL = [
-  '#9d7bff','#8b6ef0','#7b61ff','#6c5ce7','#5c6bc0',
-  '#54a0ff','#4dd0e1','#26c6da','#00bcd4','#00acc1',
-];
-const COLORS_VIOLATION = [
-  '#ff4757','#ff6348','#ff7f50','#ff9f43','#ffa726',
-  '#ffd54f','#a8d84a','#66bb6a','#26c6da','#54a0ff',
-  '#9d7bff','#b06eff','#ec407a','#26a69a','#5c6bc0',
-];
+const COLORS_TOP_IP = ['#ff4757','#ff6348','#ff7f50','#ff9f43','#ffa726','#ffd54f','#a8d84a','#66bb6a','#26c6da','#54a0ff'];
+const COLORS_TOP_URL = ['#9d7bff','#8b6ef0','#7b61ff','#6c5ce7','#5c6bc0','#54a0ff','#4dd0e1','#26c6da','#00bcd4','#00acc1'];
+const COLORS_VIOLATION = ['#ff4757','#ff6348','#ff7f50','#ff9f43','#ffa726','#ffd54f','#a8d84a','#66bb6a','#26c6da','#54a0ff','#9d7bff','#b06eff','#ec407a','#26a69a','#5c6bc0'];
 
 // ============================================================
 // FILTER PANEL HELPERS
@@ -462,23 +607,13 @@ function buildFilterList(panelId, items, activeSet, onChange){
     });
   });
 }
-
 function bindMiniBtn(btnId, activeSet, allKeys, onChange){
-  const btn = document.getElementById(btnId);
-  if (!btn) return;
-  btn.addEventListener('click', ()=>{
-    activeSet.clear();
-    allKeys.forEach(k => activeSet.add(k));
-    onChange();
-  });
+  const btn = document.getElementById(btnId); if (!btn) return;
+  btn.addEventListener('click', ()=>{ activeSet.clear(); allKeys.forEach(k => activeSet.add(k)); onChange(); });
 }
 function bindMiniBtnNone(btnId, activeSet, onChange){
-  const btn = document.getElementById(btnId);
-  if (!btn) return;
-  btn.addEventListener('click', ()=>{
-    activeSet.clear();
-    onChange();
-  });
+  const btn = document.getElementById(btnId); if (!btn) return;
+  btn.addEventListener('click', ()=>{ activeSet.clear(); onChange(); });
 }
 
 // ============================================================
@@ -490,24 +625,16 @@ function renderRequestRate(){
   const grouped = {};
   d.hourly.forEach(r=>{
     const key = periodSortKey(r.period, r.hour);
-    if (!grouped[key]){
-      grouped[key] = { period: r.period, hour: r.hour, Clean:0, Alerted:0, Blocked:0 };
-    }
+    if (!grouped[key]) grouped[key] = { period: r.period, hour: r.hour, Clean:0, Alerted:0, Blocked:0 };
     grouped[key][r.category] += r.request_count;
   });
   const keys = Object.keys(grouped).sort();
   const labels = keys.map(k => formatXLabel(grouped[k].period, grouped[k].hour, DR.unit));
   const colors = {Clean:'#00e676', Blocked:'#ff4757', Alerted:'#ff9f43'};
-  const datasets = ['Clean','Blocked','Alerted']
-    .filter(cat => FILTERS.reqRate[cat])
-    .map(cat=>({
-      label: cat,
-      data: keys.map(k=> grouped[k][cat] || 0),
-      borderColor: colors[cat],
-      backgroundColor: colors[cat] + '15',
-      fill: true,
-      borderWidth: 2.5,
-    }));
+  const datasets = ['Clean','Blocked','Alerted'].map(cat=>({
+    label: cat, data: keys.map(k=> grouped[k][cat] || 0),
+    borderColor: colors[cat], backgroundColor: colors[cat] + '15', fill: true, borderWidth: 2.5,
+  }));
   lineChart('chartReqRate', labels, datasets);
 }
 
@@ -518,31 +645,26 @@ function renderRequestDist(){
   const labels = ['Clean','Alerted','Blocked'].filter(k => k in t);
   const data = labels.map(k => t[k]);
   const cmap = {Clean:'#00e676', Alerted:'#ff9f43', Blocked:'#ff4757'};
-  const colors = labels.map(l => cmap[l] || '#00d4ff');
-  doughnutChart('chartReqDist', labels, data, colors, {legend:'bottom'});
+  doughnutChart('chartReqDist', labels, data, labels.map(l => cmap[l] || '#00d4ff'), {legend:'bottom'});
 }
 
 // ============================================================
-// HTTP RESPONSE TREND — FILTER KODE
+// HTTP RESPONSE TREND
 // ============================================================
 function renderResponseRate(){
-  const d = STATE.response_code;
-  if (!d) return;
-
-  const allCodes = Object.entries(d.totals_by_code || {})
-    .sort((a,b)=>b[1]-a[1])
+  const d = STATE.response_code; if (!d) return;
+  const allCodes = Object.entries(d.totals_by_code || {}).sort((a,b)=>b[1]-a[1])
     .map(([code, count])=>({key: code, label: code, count}));
-
+  
   if (FILTERS.resp.size === 0 && allCodes.length > 0){
     allCodes.slice(0,6).forEach(c => FILTERS.resp.add(c.key));
   }
-
+  
   buildFilterList('filterRespList', allCodes, FILTERS.resp, ()=>renderResponseRate());
   bindMiniBtn('fpRespAll', FILTERS.resp, allCodes.map(c=>c.key), ()=>renderResponseRate());
   bindMiniBtnNone('fpRespNone', FILTERS.resp, ()=>renderResponseRate());
-
+  
   const activeCodes = allCodes.filter(c => FILTERS.resp.has(c.key)).map(c=>c.key);
-
   const grouped = {};
   d.hourly.forEach(r=>{
     if (!activeCodes.includes(r.response_code)) return;
@@ -553,109 +675,68 @@ function renderResponseRate(){
   const keys = Object.keys(grouped).sort();
   const labels = keys.map(k => formatXLabel(grouped[k].period, grouped[k].hour, DR.unit));
   const datasets = activeCodes.map((code,i)=>({
-    label: code,
-    data: keys.map(k => grouped[k][code] || 0),
+    label: code, data: keys.map(k => grouped[k][code] || 0),
     borderColor: PALETTE[i % PALETTE.length],
-    backgroundColor: PALETTE[i % PALETTE.length] + '15',
-    fill: true,
-    borderWidth: 2.5,
+    backgroundColor: PALETTE[i % PALETTE.length] + '15', fill: true, borderWidth: 2.5,
   }));
   lineChart('chartRespRate', labels, datasets);
 }
 
 // ============================================================
-// STATUS CODE DISTRIBUTION — FILTER KODE
+// STATUS CODE DIST
 // ============================================================
 function renderResponseDist(){
-  const d = STATE.response_code;
-  if (!d) return;
-
-  const allCodes = Object.entries(d.totals_by_code || {})
-    .sort((a,b)=>b[1]-a[1])
-    .map(([code, count])=>{
-      const color = code === '200' ? '#00e676'
-                  : code === '404' ? '#ff4757'
-                  : code === '400' ? '#ff9f43'
-                  : code === '500' ? '#b06eff'
-                  : code === '0'   ? '#7a8aa3'
-                  : PALETTE[Object.keys(d.totals_by_code).indexOf(code) % PALETTE.length];
-      return { key: code, label: code, count, color };
-    });
-
+  const d = STATE.response_code; if (!d) return;
+  const allCodes = Object.entries(d.totals_by_code || {}).sort((a,b)=>b[1]-a[1]).map(([code, count])=>{
+    const color = code === '200' ? '#00e676' : code === '404' ? '#ff4757' : code === '400' ? '#ff9f43'
+                : code === '500' ? '#b06eff' : code === '0' ? '#7a8aa3'
+                : PALETTE[Object.keys(d.totals_by_code).indexOf(code) % PALETTE.length];
+    return { key: code, label: code, count, color };
+  });
   if (FILTERS.respdist.size === 0 && allCodes.length > 0){
     allCodes.slice(0,5).forEach(c => FILTERS.respdist.add(c.key));
   }
-
-  buildFilterList('filterRespDistList', allCodes, FILTERS.respdist, ()=>{
-    renderResponseDist();
-  });
+  buildFilterList('filterRespDistList', allCodes, FILTERS.respdist, ()=>renderResponseDist());
   bindMiniBtn('fpRespDistAll', FILTERS.respdist, allCodes.map(c=>c.key), ()=>renderResponseDist());
   bindMiniBtnNone('fpRespDistNone', FILTERS.respdist, ()=>renderResponseDist());
-
   const active = allCodes.filter(c => FILTERS.respdist.has(c.key));
-
-  vBarChart(
-    'chartRespDist',
-    active.map(x=>x.label),
-    active.map(x=>x.count),
-    { colors: active.map(x=>x.color) }
-  );
+  vBarChart('chartRespDist', active.map(x=>x.label), active.map(x=>x.count), { colors: active.map(x=>x.color) });
 }
 
 // ============================================================
-// TOP ATTACKERS — FILTER IP
+// TOP ATTACKERS
 // ============================================================
 function renderTopIP(){
-  const d = STATE.top_client_ip;
-  if (!d) return;
-
+  const d = STATE.top_client_ip; if (!d) return;
   const allItems = d.top.slice(0,20).map((x, i)=>({
-    key: x.ip_client,
-    label: x.ip_client,
-    count: x.request_count,
+    key: x.ip_client, label: x.ip_client, count: x.request_count,
     color: COLORS_TOP_IP[i % COLORS_TOP_IP.length],
   }));
-
   if (FILTERS.ip.size === 0 && allItems.length > 0){
     allItems.slice(0,10).forEach(x => FILTERS.ip.add(x.key));
   }
-
   buildFilterList('filterIPList', allItems, FILTERS.ip, ()=>renderTopIP());
   bindMiniBtn('fpIPAll', FILTERS.ip, allItems.map(c=>c.key), ()=>renderTopIP());
   bindMiniBtnNone('fpIPNone', FILTERS.ip, ()=>renderTopIP());
-
   const active = allItems.filter(x => FILTERS.ip.has(x.key));
-  hBarChart('chartTopIP',
-    active.map(x=>x.label),
-    active.map(x=>x.count),
-    { colors: active.map(x=>x.color), compact: true }
-  );
+  hBarChart('chartTopIP', active.map(x=>x.label), active.map(x=>x.count), { colors: active.map(x=>x.color), compact: true });
 }
 
 // ============================================================
-// TOP VIOLATORS — FILTER IP
+// TOP VIOLATORS
 // ============================================================
 function renderViolator(){
-  const d = STATE.top_violator_ip;
-  if (!d) return;
-
-  const allItems = d.top_ips.slice(0,20).map(x=>({
-    key: x.ip_client,
-    label: x.ip_client,
-    count: x.total_request_ip,
-  }));
-
+  const d = STATE.top_violator_ip; if (!d) return;
+  const allItems = d.top_ips.slice(0,20).map(x=>({ key: x.ip_client, label: x.ip_client, count: x.total_request_ip }));
   if (FILTERS.viol.size === 0 && allItems.length > 0){
     allItems.slice(0,8).forEach(x => FILTERS.viol.add(x.key));
   }
-
   buildFilterList('filterViolList', allItems, FILTERS.viol, ()=>renderViolator());
   bindMiniBtn('fpViolAll', FILTERS.viol, allItems.map(c=>c.key), ()=>renderViolator());
   bindMiniBtnNone('fpViolNone', FILTERS.viol, ()=>renderViolator());
-
+  
   const active = allItems.filter(x => FILTERS.viol.has(x.key));
   const activeKeys = active.map(x=>x.key);
-
   const vByIp = {};
   (d.by_ip || []).forEach(r=>{
     if (!activeKeys.includes(r.ip_client)) return;
@@ -664,143 +745,180 @@ function renderViolator(){
   });
   const allViol = new Set();
   Object.values(vByIp).forEach(m=>Object.keys(m).forEach(v=>allViol.add(v)));
-  const violList = Array.from(allViol).slice(0,6);
+  const violList = Array.from(allViol).slice(0,6); 
+  
+  const typeItems = violList.map((v,i)=>({key: v, label: v, count: 0, color: PALETTE[i % PALETTE.length]}));
+  if (FILTERS.violtype.size === 0 && typeItems.length > 0) {
+      typeItems.forEach(t => FILTERS.violtype.add(t.key));
+  }
+  buildFilterList('filterViolTypeList', typeItems, FILTERS.violtype, ()=>renderViolator());
+  bindMiniBtn('fpViolTypeAll', FILTERS.violtype, typeItems.map(t=>t.key), ()=>renderViolator());
+  bindMiniBtnNone('fpViolTypeNone', FILTERS.violtype, ()=>renderViolator());
+
+  const activeViolTypes = violList.filter(v => FILTERS.violtype.has(v));
 
   const labels = active.map(x=>x.label);
-  const datasets = violList.map((v, i)=>({
+  const datasets = activeViolTypes.map((v, i)=>({
     label: v.length>18 ? v.slice(0,18)+'…' : v,
     data: labels.map(ip => (vByIp[ip] && vByIp[ip][v]) || 0),
-    backgroundColor: PALETTE[i % PALETTE.length],
-    borderRadius: 3,
-    barThickness: 20,
+    backgroundColor: PALETTE[i % PALETTE.length], borderRadius: 3, barThickness: 20,
   }));
   stackedBarChart('chartViolator', labels, datasets);
 }
 
 // ============================================================
-// ATTACK SIGNATURES — FILTER SIG
+// ATTACK SIGNATURES
 // ============================================================
 function renderSig(){
-  const d = STATE.top_signatures;
-  if (!d) return;
-
+  const d = STATE.top_signatures; if (!d) return;
   const allItems = d.top.slice(0,30).map((x, i)=>({
-    key: x.sig_id,
-    label: x.sig_id,
-    count: x.request_count,
+    key: x.sig_id, label: x.sig_id, count: x.request_count,
     color: PALETTE[i % PALETTE.length],
   }));
-
   if (FILTERS.sig.size === 0 && allItems.length > 0){
     allItems.slice(0,15).forEach(x => FILTERS.sig.add(x.key));
   }
-
   buildFilterList('filterSigList', allItems, FILTERS.sig, ()=>renderSig());
   bindMiniBtn('fpSigAll', FILTERS.sig, allItems.map(c=>c.key), ()=>renderSig());
   bindMiniBtnNone('fpSigNone', FILTERS.sig, ()=>renderSig());
-
   const active = allItems.filter(x => FILTERS.sig.has(x.key));
-
-  vBarChart('chartSig',
-    active.map(x=>x.label),
-    active.map(x=>x.count),
-    { colors: active.map(x=>x.color) }
-  );
+  vBarChart('chartSig', active.map(x=>x.label), active.map(x=>x.count), { colors: active.map(x=>x.color) });
 }
 
 // ============================================================
-// VIOLATION CATEGORIES — FILTER JENIS
+// VIOLATION CATEGORIES
 // ============================================================
 function renderViol(){
-  const d = STATE.violations;
-  if (!d || !d.top) return;
-
+  const d = STATE.violations; if (!d || !d.top) return;
   const allItems = d.top.map((x, i)=>({
-    key: x.violation,
-    label: x.violation,
-    count: x.violation_count,
+    key: x.violation, label: x.violation, count: x.violation_count,
     color: COLORS_VIOLATION[i % COLORS_VIOLATION.length],
   }));
-
   if (FILTERS.violdist.size === 0 && allItems.length > 0){
     allItems.slice(0,10).forEach(x => FILTERS.violdist.add(x.key));
   }
-
-  buildFilterList('filterViolDistList', allItems, FILTERS.violdist, ()=>{
-    renderViol();
-  });
+  buildFilterList('filterViolDistList', allItems, FILTERS.violdist, ()=>{ renderViol(); });
   bindMiniBtn('fpViolDistAll', FILTERS.violdist, allItems.map(c=>c.key), ()=>renderViol());
   bindMiniBtnNone('fpViolDistNone', FILTERS.violdist, ()=>renderViol());
-
   const active = allItems.filter(x => FILTERS.violdist.has(x.key));
-
-  doughnutChart(
-    'chartViol',
-    active.map(x=>x.label),
-    active.map(x=>x.count),
-    active.map(x=>x.color)
-  );
+  doughnutChart('chartViol', active.map(x=>x.label), active.map(x=>x.count), active.map(x=>x.color), { legend: 'right' });
 }
 
 // ============================================================
-// ENDPOINT — FILTER URI
+// ENDPOINT
 // ============================================================
 function renderTopURL(){
-  const d = STATE.top_url;
-  if (!d) return;
-
+  const d = STATE.top_url; if (!d) return;
   const allItems = d.top.slice(0,20).map((x, i)=>({
-    key: x.uri,
-    label: x.uri,
-    count: x.request_count,
+    key: x.uri, label: x.uri, count: x.request_count,
     color: COLORS_TOP_URL[i % COLORS_TOP_URL.length],
   }));
-
   if (FILTERS.url.size === 0 && allItems.length > 0){
     allItems.slice(0,10).forEach(x => FILTERS.url.add(x.key));
   }
-
   buildFilterList('filterURLList', allItems, FILTERS.url, ()=>renderTopURL());
   bindMiniBtn('fpURLAll', FILTERS.url, allItems.map(c=>c.key), ()=>renderTopURL());
   bindMiniBtnNone('fpURLNone', FILTERS.url, ()=>renderTopURL());
-
   const active = allItems.filter(x => FILTERS.url.has(x.key));
-
-  hBarChart('chartTopURL',
-    active.map(x=>x.label),
-    active.map(x=>x.count),
-    { colors: active.map(x=>x.color), compact: true, longLabel: true }
-  );
+  hBarChart('chartTopURL', active.map(x=>x.label), active.map(x=>x.count), { colors: active.map(x=>x.color), compact: true, longLabel: true });
 }
 
-function renderRawTable(){
+// ============================================================
+// LIVE LOG STREAM
+// ============================================================
+const KMON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+function kibanaTimestamp(iso){
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  const w = new Date(d.getTime() + 7 * 3600 * 1000);
+  return {
+    label: `${KMON[w.getUTCMonth()]} ${w.getUTCDate()}, ${w.getUTCFullYear()} @ ` +
+           `${pad2(w.getUTCHours())}:${pad2(w.getUTCMinutes())}:${pad2(w.getUTCSeconds())}.` +
+           String(w.getUTCMilliseconds()).padStart(3, '0'),
+    epoch: d.getTime() / 1000,
+  };
+}
+function normalizeRaw(d){
+  if (!d || !d.rows || !d.rows.length) return d;
+  const isoRe = /^\d{4}-\d{2}-\d{2}T/;
+  if (isoRe.test(String(d.rows[0].log_time || ''))){
+    d.rows.forEach(r=>{
+      const k = kibanaTimestamp(r.log_time);
+      if (k){ r.log_time = k.label; r.log_epoch = k.epoch; } else { r.log_epoch = 0; }
+    });
+  }
+  d.rows.sort((a,b)=> (b.log_epoch || 0) - (a.log_epoch || 0));
+  if (!d.latest_epoch){
+    d.latest_epoch = d.rows[0].log_epoch || 0;
+    d.latest_log_time = d.rows[0].log_time;
+  }
+  if (!d.fetched_at){
+    const n = new Date(Date.now() + 7 * 3600 * 1000);
+    d.fetched_at = `${n.getUTCFullYear()}-${pad2(n.getUTCMonth()+1)}-${pad2(n.getUTCDate())} ${pad2(n.getUTCHours())}:${pad2(n.getUTCMinutes())}:${pad2(n.getUTCSeconds())}`;
+  }
+  return d;
+}
+function fmtAge(sec){
+  if (sec < 0) sec = 0;
+  if (sec < 60) return `${Math.floor(sec)} dtk lalu`;
+  if (sec < 3600) return `${Math.floor(sec/60)} mnt lalu`;
+  if (sec < 86400) return `${Math.floor(sec/3600)} jam ${Math.floor((sec%3600)/60)} mnt lalu`;
+  return `${Math.floor(sec/86400)} hari lalu`;
+}
+function updateLogMeta(){
+  const el = document.getElementById('logMeta'); if (!el) return;
   const d = STATE.raw_log_detail;
+  if (!d || !d.latest_log_time){ el.textContent = 'Belum ada data log.'; return; }
+  const age = Date.now()/1000 - d.latest_epoch;
+  const cls = age < 300 ? 'fresh' : (age < 1800 ? 'aging' : 'stale');
+  el.innerHTML = `Log terbaru: <b>${escapeHtml(d.latest_log_time)}</b> ` +
+    `(<span class="log-age ${cls}">${fmtAge(age)}</span>) · ditarik ${escapeHtml((d.fetched_at || '').slice(11))} WIB · baris teratas = log terbaru`;
+}
+function renderRawTable(){
+  const d = normalizeRaw(STATE.raw_log_detail);
   const tbody = document.querySelector('#tblRaw tbody');
   if (!d || !d.rows || !d.rows.length){
     tbody.innerHTML = `<tr><td colspan="10" class="empty">Belum ada data.</td></tr>`;
     document.getElementById('reqCount').textContent = '(0 documents)';
-    return;
+    updateLogMeta(); return;
   }
   document.getElementById('reqCount').textContent = `(${fmtNum(d.total_fetched)} documents)`;
+  const e = v => (v === null || v === undefined || v === '') ? '–' : escapeHtml(v);
   tbody.innerHTML = d.rows.map(r=>`
     <tr>
-      <td>${r.log_time ? r.log_time.replace('T',' ').slice(0,19) : '–'}</td>
-      <td>${r.ip_client || '–'}</td>
-      <td>${r.source_ip || '–'}</td>
-      <td>${r.host_ip || '–'}</td>
-      <td>${r.method || '–'}</td>
-      <td>${r.x_forwarded_for || '–'}</td>
-      <td>${r.dest_port || '–'}</td>
-      <td title="${r.uri || ''}">${r.uri || '–'}</td>
-      <td>${r.response_code || '–'}</td>
-      <td>${r.request_status || '–'}</td>
+      <td>${e(r.log_time)}</td><td>${e(r.ip_client)}</td><td>${e(r.source_ip)}</td>
+      <td>${e(r.host_ip)}</td><td>${e(r.method)}</td><td>${e(r.x_forwarded_for)}</td>
+      <td>${e(r.dest_port)}</td><td title="${escapeHtml(r.uri || '')}">${e(r.uri)}</td>
+      <td>${e(r.response_code)}</td><td>${e(r.request_status)}</td>
     </tr>
   `).join('');
+  const sc = document.querySelector('#tblRaw').closest('.table-scroll');
+  if (sc) sc.scrollTop = 0;
+  updateLogMeta();
+}
+let RAW_BUSY = false;
+async function refreshRaw(opts){
+  const silent = !!(opts && opts.silent);
+  if (RAW_BUSY) return;
+  RAW_BUSY = true;
+  if (!silent) setLoading(true, 'Menarik raw log…');
+  try{
+    STATE.raw_log_detail = await fetchData('raw_log_detail', liveRange());
+    renderRawTable();
+  }catch(err){
+    console.error('Gagal raw log:', err);
+    if (!silent) alert('Gagal: ' + err.message);
+  }finally{
+    RAW_BUSY = false;
+    if (!silent) setLoading(false);
+  }
 }
 
+// ============================================================
+// KPI SPARKLINES
+// ============================================================
 function renderKPI(){
-  const d = STATE.request_distribution;
-  if (!d) return;
+  const d = STATE.request_distribution; if (!d) return;
   const t = d.totals_by_category || {}, total = d.grand_total || 1;
   [['Blocked','kpiBlockedPct'],['Alerted','kpiAlertedPct'],['Clean','kpiCleanPct']].forEach(([k,id])=>{
     const el = document.getElementById(id);
@@ -823,8 +941,6 @@ function renderKPI(){
 function renderAll(){
   renderPosture();
   renderKPI();
-  renderSeverity();
-  renderBanner();
   renderHeatmap();
   renderRequestRate();
   renderRequestDist();
@@ -839,10 +955,9 @@ function renderAll(){
 }
 
 // ============================================================
-// MODAL POPUP SYSTEM
+// MODAL
 // ============================================================
 const MODAL = {};
-
 function initModal(){
   MODAL.el = document.getElementById('modalOverlay');
   MODAL.titleEl = document.getElementById('modalTitle');
@@ -854,34 +969,25 @@ function initModal(){
   MODAL.el.addEventListener('click', (e)=>{ if (e.target === MODAL.el) closeModal(); });
   document.addEventListener('keydown', (e)=>{ if (e.key === 'Escape') closeModal(); });
 }
-
 function openModal(config){
   MODAL.titleEl.textContent = config.title || 'Data Detail';
   MODAL.subtitleEl.textContent = config.subtitle || '—';
   if (config.info && config.info.length){
     MODAL.infoEl.innerHTML = config.info.map(it=>`
       <div class="modal-info-item ${it.class || ''}">
-        <span class="mii-label">${it.label}</span>
-        <span class="mii-value">${it.value}</span>
-      </div>
-    `).join('');
+        <span class="mii-label">${it.label}</span><span class="mii-value">${it.value}</span>
+      </div>`).join('');
     MODAL.infoEl.style.display = 'flex';
-  } else {
-    MODAL.infoEl.style.display = 'none';
-  }
+  } else { MODAL.infoEl.style.display = 'none'; }
   MODAL.theadEl.innerHTML = `<tr>${config.columns.map(c=>`<th>${c.label}</th>`).join('')}</tr>`;
   if (!config.rows || !config.rows.length){
     MODAL.tbodyEl.innerHTML = `<tr><td colspan="${config.columns.length}" class="empty">Tidak ada data</td></tr>`;
   } else {
     MODAL.tbodyEl.innerHTML = config.rows.map(row=>`
-      <tr>
-        ${config.columns.map(c=>{
-          let val = row[c.key];
-          if (c.format) val = c.format(val, row);
-          return `<td>${val ?? '–'}</td>`;
-        }).join('')}
-      </tr>
-    `).join('');
+      <tr>${config.columns.map(c=>{
+        let val = row[c.key]; if (c.format) val = c.format(val, row);
+        return `<td>${val ?? '–'}</td>`;
+      }).join('')}</tr>`).join('');
   }
   MODAL.el.classList.remove('hidden');
 }
@@ -891,79 +997,34 @@ function closeModal(){ if (MODAL.el) MODAL.el.classList.add('hidden'); }
 // POPUP HANDLERS
 // ============================================================
 function showThreatModal(){
+  ensureAttackAnalysis();
   const t = computeThreatLevel();
-  const statusRow = (label, value, kind) => ({
-    klasifikasi: label,
-    jumlah: fmtNum(value),
-    status: kind === 'danger' ? 'TIDAK AMAN' : (kind === 'warn' ? 'WASPADA' : 'AMAN'),
-    keterangan: kind === 'danger' ? 'Ada request diblokir' : (kind === 'warn' ? 'Ada request di-alert' : 'Semua request lolos tanpa ancaman'),
-  });
-  const rows = [
-    statusRow('Total Request', t.total, 'safe'),
-    statusRow('Clean', t.clean, 'safe'),
-    statusRow('Alerted', t.alerted, 'warn'),
-    statusRow('Blocked', t.blocked, t.blocked > 0 ? 'danger' : 'safe'),
-  ];
+  if (!t.available){ alert('Data analisis serangan belum ditarik'); return; }
+  const rows = t.components.map(c=>({
+    komponen: c.label, poin: String(c.points).replace('.', ','), maks: c.max, detail: c.detail,
+  }));
+  rows.push({ komponen: '<b>TOTAL SKOR</b>', poin: `<b>${t.score}</b>`, maks: 100, detail: `Status: ${t.status}` });
   openModal({
-    title: 'THREAT LEVEL - Detail Perhitungan',
-    subtitle: `Skor ${t.score}/100 · Status: ${t.status}`,
+    title: 'THREAT LEVEL - Weighted Scoring (v10)',
+    subtitle: `(Alerted×40%) + (Blocked×40%) + (Lonjakan×20%) · Skor ${t.score}/100 · ${t.status}`,
     info: [
-      { label: 'Threat Score', value: t.score, class: t.class },
-      { label: 'Status', value: t.status, class: t.class },
-      { label: 'Blocked', value: fmtNum(t.blocked), class: 'danger' },
-      { label: 'Alerted', value: fmtNum(t.alerted), class: 'warn' },
-      { label: 'Clean', value: fmtNum(t.clean), class: 'safe' },
-      { label: 'Total', value: fmtNum(t.total) },
+      { label: 'Threat Score', value: t.score, class: t.cls },
+      { label: 'Status', value: t.status, class: t.cls },
+      { label: 'Total Request', value: fmtNum(t.total) },
+      { label: 'Alerted', value: `${fmtNum(t.alerted)} <small style="color:var(--dim);font-size:11px">${t.alertedRate.toFixed(2)}%</small>`, class: 'warn' },
+      { label: 'Blocked', value: `${fmtNum(t.blocked)} <small style="color:var(--dim);font-size:11px">${t.blockedRate.toFixed(2)}%</small>`, class: 'safe' },
+      { label: '24 Jam Terakhir', value: fmtNum(t.last24) },
     ],
     columns: [
-      { key: 'klasifikasi', label: 'Klasifikasi' },
-      { key: 'jumlah', label: 'Jumlah' },
-      { key: 'status', label: 'Status Sistem', format: (v)=>
-        `<span class="badge ${v === 'TIDAK AMAN' ? 'badge-danger' : (v === 'WASPADA' ? 'badge-warn' : 'badge-safe')}">${v}</span>`
-      },
-      { key: 'keterangan', label: 'Keterangan' },
+      { key: 'komponen', label: 'Komponen' }, { key: 'poin', label: 'Poin' },
+      { key: 'maks', label: 'Maks' }, { key: 'detail', label: 'Perhitungan' },
     ],
     rows,
   });
 }
-
-function showSeverityModal(){
-  const d = STATE.violations;
-  if (!d || !d.top) { alert('Data violations belum ditarik'); return; }
-  const rows = d.top.map(v=>{
-    const sev = SEVERITY_MAP[v.violation] || 'Medium';
-    return { violation: v.violation, severity: sev, count: fmtNum(v.violation_count) };
-  });
-  const buckets = {Critical:0, High:0, Medium:0, Low:0};
-  d.top.forEach(v=>{
-    const sev = SEVERITY_MAP[v.violation] || 'Medium';
-    buckets[sev] += v.violation_count;
-  });
-  openModal({
-    title: 'SEVERITY BREAKDOWN',
-    subtitle: `${rows.length} jenis pelanggaran terdeteksi`,
-    info: [
-      { label: 'Critical', value: fmtNum(buckets.Critical), class: 'danger' },
-      { label: 'High', value: fmtNum(buckets.High), class: 'danger' },
-      { label: 'Medium', value: fmtNum(buckets.Medium), class: 'warn' },
-      { label: 'Low', value: fmtNum(buckets.Low), class: 'safe' },
-    ],
-    columns: [
-      { key: 'violation', label: 'Jenis Pelanggaran' },
-      { key: 'severity', label: 'Severity', format: (v)=>
-        `<span class="badge ${v==='Critical'||v==='High'?'badge-danger':(v==='Medium'?'badge-warn':'badge-safe')}">${v}</span>`
-      },
-      { key: 'count', label: 'Jumlah Event' },
-    ],
-    rows,
-  });
-}
-
 function showLiveStatsModal(){
-  const d = STATE.request_distribution;
-  if (!d) { alert('Data belum ditarik'); return; }
-  const t = d.totals_by_category || {};
-  const total = d.grand_total || 0;
+  const d = STATE.request_distribution; if (!d) { alert('Data belum ditarik'); return; }
+  const t = d.totals_by_category || {}, total = d.grand_total || 0;
   const rows = [
     { kategori: 'Total Request', jumlah: fmtNum(total), persen: '100%' },
     { kategori: 'Clean', jumlah: fmtNum(t.Clean || 0), persen: ((t.Clean/total)*100).toFixed(2)+'%' },
@@ -971,8 +1032,7 @@ function showLiveStatsModal(){
     { kategori: 'Blocked', jumlah: fmtNum(t.Blocked || 0), persen: ((t.Blocked/total)*100).toFixed(2)+'%' },
   ];
   openModal({
-    title: 'LIVE STATS',
-    subtitle: `Periode: ${fmtDTFull(DR.start)} → ${fmtDTFull(DR.end)}`,
+    title: 'LIVE STATS', subtitle: `Periode: ${fmtDTFull(DR.start)} → ${fmtDTFull(DR.end)}`,
     info: [
       { label: 'Total', value: fmtNum(total) },
       { label: 'Clean', value: fmtNum(t.Clean || 0), class: 'safe' },
@@ -980,266 +1040,172 @@ function showLiveStatsModal(){
       { label: 'Blocked', value: fmtNum(t.Blocked || 0), class: 'danger' },
     ],
     columns: [
-      { key: 'kategori', label: 'Kategori' },
-      { key: 'jumlah', label: 'Jumlah Request' },
+      { key: 'kategori', label: 'Kategori' }, { key: 'jumlah', label: 'Jumlah Request' },
       { key: 'persen', label: 'Persentase' },
     ],
     rows,
   });
 }
-
 function showReqRateModal(){
-  const d = STATE.request_distribution;
-  if (!d || !d.hourly) { alert('Data belum ditarik'); return; }
-  const rows = [...d.hourly].sort((a,b)=>{
-    return periodSortKey(b.period, b.hour).localeCompare(periodSortKey(a.period, a.hour));
-  }).map(r=>({ period: r.period, hour: r.hour, category: r.category, count: fmtNum(r.request_count) }));
+  const d = STATE.request_distribution; if (!d || !d.hourly) { alert('Data belum ditarik'); return; }
+  const rows = [...d.hourly].sort((a,b)=>periodSortKey(b.period, b.hour).localeCompare(periodSortKey(a.period, a.hour)))
+    .map(r=>({ period: r.period, hour: r.hour, category: r.category, count: fmtNum(r.request_count) }));
   openModal({
-    title: 'REQUEST RATE - Data per Jam',
-    subtitle: `Total ${rows.length} baris · X-axis: ${DR.unit}`,
-    info: [
-      { label: 'Total Baris', value: fmtNum(rows.length) },
-      { label: 'Unit', value: DR.unit.toUpperCase() },
-    ],
+    title: 'REQUEST RATE - Data per Jam', subtitle: `Total ${rows.length} baris · X-axis: ${DR.unit}`,
+    info: [{ label: 'Total Baris', value: fmtNum(rows.length) }, { label: 'Unit', value: DR.unit.toUpperCase() }],
     columns: [
-      { key: 'period', label: 'Tanggal' },
-      { key: 'hour', label: 'Jam' },
+      { key: 'period', label: 'Tanggal' }, { key: 'hour', label: 'Jam' },
       { key: 'category', label: 'Kategori', format: (v)=>
-        `<span class="badge ${v==='Clean'?'badge-safe':(v==='Alerted'?'badge-warn':'badge-danger')}">${v}</span>`
-      },
+        `<span class="badge ${v==='Clean'?'badge-safe':(v==='Alerted'?'badge-warn':'badge-danger')}">${v}</span>` },
       { key: 'count', label: 'Jumlah Request' },
     ],
     rows,
   });
 }
-
 function showReqDistModal(){
-  const d = STATE.request_distribution;
-  if (!d) { alert('Data belum ditarik'); return; }
+  const d = STATE.request_distribution; if (!d) { alert('Data belum ditarik'); return; }
   const t = d.totals_by_category || {};
   const total = Object.values(t).reduce((a,b)=>a+b,0) || 1;
-  const rows = Object.entries(t).map(([k,v])=>({
-    kategori: k, jumlah: fmtNum(v), persen: ((v/total)*100).toFixed(2)+'%',
-  }));
+  const rows = Object.entries(t).map(([k,v])=>({ kategori: k, jumlah: fmtNum(v), persen: ((v/total)*100).toFixed(2)+'%' }));
   openModal({
-    title: 'TRAFFIC COMPOSITION',
-    subtitle: 'Distribusi Clean vs Alerted vs Blocked',
+    title: 'TRAFFIC COMPOSITION', subtitle: 'Distribusi Clean vs Alerted vs Blocked',
     info: [{ label: 'Total', value: fmtNum(total) }],
     columns: [
       { key: 'kategori', label: 'Kategori', format: (v)=>
-        `<span class="badge ${v==='Clean'?'badge-safe':(v==='Alerted'?'badge-warn':'badge-danger')}">${v}</span>`
-      },
-      { key: 'jumlah', label: 'Jumlah' },
-      { key: 'persen', label: 'Persentase' },
+        `<span class="badge ${v==='Clean'?'badge-safe':(v==='Alerted'?'badge-warn':'badge-danger')}">${v}</span>` },
+      { key: 'jumlah', label: 'Jumlah' }, { key: 'persen', label: 'Persentase' },
     ],
     rows,
   });
 }
-
 function showHeatmapModal(){
-  const d = STATE.top_violator_ip;
-  if (!d || !d.hourly) { alert('Data belum ditarik'); return; }
-  const rows = [...d.hourly].sort((a,b)=>{
-    return periodSortKey(b.period, b.hour).localeCompare(periodSortKey(a.period, a.hour));
-  }).map(r=>({
-    period: r.period, hour: r.hour, ip_client: r.ip_client,
-    violation: r.violation, count: fmtNum(r.violation_count),
-  }));
+  ensureAttackAnalysis();
+  const a = STATE.attack_analysis; if (!a || !a.hourly) { alert('Data analisis serangan belum ditarik'); return; }
+  const {bucket, total} = buildHeatBuckets();
+  let maxVal = 0, peak = {d:0, h:0};
+  for (let d=0; d<7; d++) for (let h=0; h<24; h++) if (bucket[d][h] > maxVal){ maxVal = bucket[d][h]; peak = {d, h}; }
+  const rows = [...a.hourly].sort((x,y)=>periodSortKey(y.period, y.hour).localeCompare(periodSortKey(x.period, x.hour)))
+    .map(r=>({ period: r.period, hour: r.hour, count: r.count }));
   openModal({
     title: 'ATTACK HEATMAP',
-    subtitle: `${rows.length} baris pelanggaran`,
+    subtitle: `${fmtNum(rows.length)} jam dengan serangan · WIB`,
     info: [
-      { label: 'Total Baris', value: fmtNum(rows.length) },
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
+      { label: 'Total Serangan', value: fmtNum(total), class: 'warn' },
+      { label: 'Jam Aktif', value: fmtNum(rows.length) },
+      { label: 'Puncak', value: maxVal ? `${DAY_SHORT[peak.d]} ${pad2(peak.h)}:00` : '–' },
+      { label: 'Serangan di Puncak', value: fmtNum(maxVal), class: 'danger' },
     ],
     columns: [
-      { key: 'period', label: 'Tanggal' },
-      { key: 'hour', label: 'Jam' },
-      { key: 'violation', label: 'Jenis Violation' },
-      { key: 'count', label: 'Jumlah' },
+      { key: 'period', label: 'Tanggal' }, { key: 'hour', label: 'Jam' },
+      { key: 'count', label: 'Jumlah Serangan', format: v => fmtNum(v) },
     ],
     rows,
   });
 }
-
 function showRespRateModal(){
-  const d = STATE.response_code;
-  if (!d || !d.hourly) { alert('Data belum ditarik'); return; }
-  const rows = [...d.hourly].sort((a,b)=>{
-    return periodSortKey(b.period, b.hour).localeCompare(periodSortKey(a.period, a.hour));
-  }).map(r=>({ period: r.period, hour: r.hour, code: r.response_code, count: fmtNum(r.request_count) }));
+  const d = STATE.response_code; if (!d || !d.hourly) { alert('Data belum ditarik'); return; }
+  const rows = [...d.hourly].sort((a,b)=>periodSortKey(b.period, b.hour).localeCompare(periodSortKey(a.period, a.hour)))
+    .map(r=>({ period: r.period, hour: r.hour, code: r.response_code, count: fmtNum(r.request_count) }));
   openModal({
-    title: 'HTTP RESPONSE TREND',
-    subtitle: `${rows.length} baris respons HTTP`,
-    info: [
-      { label: 'Total Baris', value: fmtNum(rows.length) },
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-    ],
+    title: 'HTTP RESPONSE TREND', subtitle: `${rows.length} baris respons HTTP`,
+    info: [{ label: 'Total Baris', value: fmtNum(rows.length) }, { label: 'Grand Total', value: fmtNum(d.grand_total) }],
     columns: [
-      { key: 'period', label: 'Tanggal' },
-      { key: 'hour', label: 'Jam' },
-      { key: 'code', label: 'Response Code' },
-      { key: 'count', label: 'Jumlah' },
+      { key: 'period', label: 'Tanggal' }, { key: 'hour', label: 'Jam' },
+      { key: 'code', label: 'Response Code' }, { key: 'count', label: 'Jumlah' },
     ],
     rows,
   });
 }
-
 function showRespDistModal(){
-  const d = STATE.response_code;
-  if (!d) { alert('Data belum ditarik'); return; }
+  const d = STATE.response_code; if (!d) { alert('Data belum ditarik'); return; }
   const t = d.totals_by_code || {};
   const sorted = Object.entries(t).sort((a,b)=>b[1]-a[1]);
   const total = sorted.reduce((s, [,v])=>s+v, 0) || 1;
-  const rows = sorted.map(([code, count])=>({
-    code, count: fmtNum(count), persen: ((count/total)*100).toFixed(2)+'%',
-  }));
+  const rows = sorted.map(([code, count])=>({ code, count: fmtNum(count), persen: ((count/total)*100).toFixed(2)+'%' }));
   openModal({
-    title: 'STATUS CODE DISTRIBUTION',
-    subtitle: `${sorted.length} kode respons`,
-    info: [
-      { label: 'Total', value: fmtNum(total) },
-      { label: 'Kode Unik', value: sorted.length },
-    ],
+    title: 'STATUS CODE DISTRIBUTION', subtitle: `${sorted.length} kode respons`,
+    info: [{ label: 'Total', value: fmtNum(total) }, { label: 'Kode Unik', value: sorted.length }],
     columns: [
-      { key: 'code', label: 'Response Code' },
-      { key: 'count', label: 'Jumlah' },
+      { key: 'code', label: 'Response Code' }, { key: 'count', label: 'Jumlah' },
       { key: 'persen', label: 'Persentase' },
     ],
     rows,
   });
 }
-
 function showTopIPModal(){
-  const d = STATE.top_client_ip;
-  if (!d || !d.top) { alert('Data belum ditarik'); return; }
+  const d = STATE.top_client_ip; if (!d || !d.top) { alert('Data belum ditarik'); return; }
   const rows = d.top.map(x=>({ ip_client: x.ip_client, count: fmtNum(x.request_count) }));
   openModal({
-    title: 'TOP ATTACKERS',
-    subtitle: `Top ${rows.length} IP`,
-    info: [
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-      { label: 'IP Ditampilkan', value: rows.length },
-    ],
-    columns: [
-      { key: 'ip_client', label: 'IP Client' },
-      { key: 'count', label: 'Jumlah Request' },
-    ],
+    title: 'TOP ATTACKERS', subtitle: `Top ${rows.length} IP`,
+    info: [{ label: 'Grand Total', value: fmtNum(d.grand_total) }, { label: 'IP Ditampilkan', value: rows.length }],
+    columns: [{ key: 'ip_client', label: 'IP Client' }, { key: 'count', label: 'Jumlah Request' }],
     rows,
   });
 }
-
 function showViolatorModal(){
-  const d = STATE.top_violator_ip;
-  if (!d || !d.by_ip) { alert('Data belum ditarik'); return; }
-  const rows = [...d.by_ip].sort((a,b)=> b.violation_count - a.violation_count).map(r=>({
-    ip_client: r.ip_client,
-    violation: r.violation, count: fmtNum(r.violation_count),
-    total_ip: fmtNum(r.total_request_ip),
+  const d = STATE.top_violator_ip; if (!d || !d.by_ip) { alert('Data belum ditarik'); return; }
+  const rows = [...d.by_ip].sort((a,b)=>b.violation_count - a.violation_count).map(r=>({
+    ip_client: r.ip_client, violation: r.violation, count: fmtNum(r.violation_count), total_ip: fmtNum(r.total_request_ip),
   }));
   openModal({
-    title: 'TOP VIOLATORS',
-    subtitle: `${rows.length} baris data violator`,
-    info: [
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-      { label: 'Total Baris', value: fmtNum(rows.length) },
-    ],
+    title: 'TOP VIOLATORS', subtitle: `${rows.length} baris data violator`,
+    info: [{ label: 'Grand Total', value: fmtNum(d.grand_total) }, { label: 'Total Baris', value: fmtNum(rows.length) }],
     columns: [
-      { key: 'ip_client', label: 'IP Client' },
-      { key: 'violation', label: 'Violation' },
-      { key: 'count', label: 'Jumlah Violation' },
-      { key: 'total_ip', label: 'Total Request IP' },
+      { key: 'ip_client', label: 'IP Client' }, { key: 'violation', label: 'Violation' },
+      { key: 'count', label: 'Jumlah Violation' }, { key: 'total_ip', label: 'Total Request IP' },
     ],
     rows,
   });
 }
-
 function showSigModal(){
-  const d = STATE.top_signatures;
-  if (!d || !d.top) { alert('Data belum ditarik'); return; }
+  const d = STATE.top_signatures; if (!d || !d.top) { alert('Data belum ditarik'); return; }
   const rows = d.top.map(x=>({ sig_id: x.sig_id, count: fmtNum(x.request_count) }));
   openModal({
-    title: 'TOP ATTACK SIGNATURES',
-    subtitle: `Top ${rows.length} signature IDs`,
-    info: [
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-      { label: 'Total Sig', value: rows.length },
-    ],
-    columns: [
-      { key: 'sig_id', label: 'Signature ID' },
-      { key: 'count', label: 'Jumlah Event' },
-    ],
+    title: 'TOP ATTACK SIGNATURES', subtitle: `Top ${rows.length} signature IDs`,
+    info: [{ label: 'Grand Total', value: fmtNum(d.grand_total) }, { label: 'Total Sig', value: rows.length }],
+    columns: [{ key: 'sig_id', label: 'Signature ID' }, { key: 'count', label: 'Jumlah Event' }],
     rows,
   });
 }
-
 function showViolModal(){
-  const d = STATE.violations;
-  if (!d || !d.top) { alert('Data belum ditarik'); return; }
+  const d = STATE.violations; if (!d || !d.top) { alert('Data belum ditarik'); return; }
   const rows = d.top.map(x=>({ violation: x.violation, count: fmtNum(x.violation_count) }));
   openModal({
-    title: 'VIOLATION CATEGORIES',
-    subtitle: `${rows.length} jenis pelanggaran`,
-    info: [
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-      { label: 'Jenis Violation', value: rows.length },
-    ],
-    columns: [
-      { key: 'violation', label: 'Jenis Pelanggaran' },
-      { key: 'count', label: 'Jumlah Event' },
-    ],
+    title: 'VIOLATION CATEGORIES', subtitle: `${rows.length} jenis pelanggaran`,
+    info: [{ label: 'Grand Total', value: fmtNum(d.grand_total) }, { label: 'Jenis Violation', value: rows.length }],
+    columns: [{ key: 'violation', label: 'Jenis Pelanggaran' }, { key: 'count', label: 'Jumlah Event' }],
     rows,
   });
 }
-
 function showTopURLModal(){
-  const d = STATE.top_url;
-  if (!d || !d.top) { alert('Data belum ditarik'); return; }
+  const d = STATE.top_url; if (!d || !d.top) { alert('Data belum ditarik'); return; }
   const rows = d.top.map(x=>({ uri: x.uri, count: fmtNum(x.request_count) }));
   openModal({
-    title: 'ENDPOINT PALING SERING DISERANG',
-    subtitle: `Top ${rows.length} URI`,
-    info: [
-      { label: 'Grand Total', value: fmtNum(d.grand_total) },
-      { label: 'URI Ditampilkan', value: rows.length },
-    ],
-    columns: [
-      { key: 'uri', label: 'URI' },
-      { key: 'count', label: 'Jumlah Request' },
-    ],
+    title: 'ENDPOINT PALING SERING DISERANG', subtitle: `Top ${rows.length} URI`,
+    info: [{ label: 'Grand Total', value: fmtNum(d.grand_total) }, { label: 'URI Ditampilkan', value: rows.length }],
+    columns: [{ key: 'uri', label: 'URI' }, { key: 'count', label: 'Jumlah Request' }],
     rows,
   });
 }
 
 const SEE_DATA_HANDLERS = {
-  threat: showThreatModal,
-  severity: showSeverityModal,
-  livestats: showLiveStatsModal,
-  reqrate: showReqRateModal,
-  reqdist: showReqDistModal,
-  heatmap: showHeatmapModal,
-  resprate: showRespRateModal,
-  respdist: showRespDistModal,
-  topip: showTopIPModal,
-  violator: showViolatorModal,
-  sig: showSigModal,
-  viol: showViolModal,
-  topurl: showTopURLModal,
+  threat: showThreatModal, livestats: showLiveStatsModal,
+  reqrate: showReqRateModal, reqdist: showReqDistModal, heatmap: showHeatmapModal,
+  resprate: showRespRateModal, respdist: showRespDistModal, topip: showTopIPModal,
+  violator: showViolatorModal, sig: showSigModal, viol: showViolModal, topurl: showTopURLModal,
 };
-
 function bindSeeDataButtons(){
   document.querySelectorAll('.btn-see-data').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.preventDefault();
-      const key = btn.dataset.see;
-      const handler = SEE_DATA_HANDLERS[key];
+      const handler = SEE_DATA_HANDLERS[btn.dataset.see];
       if (handler) handler();
     });
   });
 }
 
 // ============================================================
-// FILTER TOGGLE & PANEL
+// FILTER TOGGLE
 // ============================================================
 function bindFilterToggles(){
   document.querySelectorAll('#filterReqRate .toggle-chip').forEach(chip=>{
@@ -1253,38 +1219,36 @@ function bindFilterToggles(){
       renderRequestRate();
     });
   });
-
   document.querySelectorAll('.btn-filter').forEach(btn=>{
     btn.addEventListener('click', (e)=>{
       e.preventDefault();
       const target = btn.dataset.filterTarget;
       const panelMap = {
-        resp:     'filterRespPanel',
-        respdist: 'filterRespDistPanel',
-        ip:       'filterIPPanel',
-        viol:     'filterViolPanel',
-        sig:      'filterSigPanel',
-        violdist: 'filterViolDistPanel',
-        url:      'filterURLPanel',
+        resp:'filterRespPanel', respdist:'filterRespDistPanel', ip:'filterIPPanel',
+        viol:'filterViolPanel', violtype:'filterViolTypePanel', sig:'filterSigPanel', violdist:'filterViolDistPanel', url:'filterURLPanel',
       };
-      const panelId = panelMap[target];
-      if (!panelId) return;
-      const panel = document.getElementById(panelId);
-      if (!panel) return;
+      const panelId = panelMap[target]; if (!panelId) return;
+      const panel = document.getElementById(panelId); if (!panel) return;
       const willOpen = panel.classList.contains('hidden');
-
       Object.values(panelMap).forEach(id=>{
-        const p = document.getElementById(id);
-        if (p) p.classList.add('hidden');
+        const p = document.getElementById(id); if (p) p.classList.add('hidden');
       });
       document.querySelectorAll('.btn-filter').forEach(b=>b.classList.remove('active'));
-
-      if (willOpen){
-        panel.classList.remove('hidden');
-        btn.classList.add('active');
-      }
+      if (willOpen){ panel.classList.remove('hidden'); btn.classList.add('active'); }
     });
   });
+}
+
+// ============================================================
+// STATUS NOTICE
+// ============================================================
+function showNotice(failed){
+  const el = document.getElementById('statusNotice'); if (!el) return;
+  if (!failed || !failed.length){ el.classList.add('hidden'); el.innerHTML = ''; return; }
+  const others = failed.filter(f => !String(f).includes('tidak dikenal'));
+  if (!others.length){ el.classList.add('hidden'); el.innerHTML = ''; return; }
+  el.innerHTML = `<b>⚠ Sebagian data gagal ditarik:</b><ul>${others.map(f => `<li>${escapeHtml(f)}</li>`).join('')}</ul>`;
+  el.classList.remove('hidden');
 }
 
 // ============================================================
@@ -1301,64 +1265,54 @@ function shiftDate(d, n, u){
   if (u === 'years')   x.setFullYear(x.getFullYear() - n);
   return x;
 }
-
-// Rentang relatif ("Last 8 months", "Last 3 hours", Today, ...) selalu dihitung ulang
-// dari waktu SEKARANG saat data ditarik. Rentang custom (tanggal tetap) tidak diubah.
 function refreshRange(){
-  if (DR.mode === 'quick' && DR.quickVal){
-    const r = computeFromQuick(DR.quickVal);
-    DR.start = r.start; DR.end = r.end;
-  } else if (DR.rel){
-    const now = new Date();
-    DR.start = shiftDate(now, DR.rel.num, DR.rel.unit); DR.end = now;
+  if ((DR.mode === 'quick' && DR.quickVal) || DR.rel){
+    const r = liveRange(); DR.start = r.start; DR.end = r.end;
   }
   updateRangeInfo();
 }
-
 function setLastUpdate(ok){
-  const el = document.getElementById('lastUpdate');
+  const el = document.getElementById('lastUpdate'); 
+  const card = document.getElementById('lastUpdateCard');
   if (!el) return;
   const d = new Date();
-  el.textContent = (ok ? '● Diperbarui ' : '⚠ Sebagian gagal · ') + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-  el.classList.toggle('stale', !ok);
+  el.textContent = (ok ? 'Diperbarui ' : 'Sebagian gagal · ') + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  if(card) card.classList.toggle('stale', !ok);
 }
 
 async function refreshAll(opts){
-  const silent = !!(opts && opts.silent === true);   // auto-refresh: tanpa overlay & filter tidak di-reset
+  const silent = !!(opts && opts.silent === true);
   if (REFRESHING) return;
   REFRESHING = true;
   refreshRange();
   if (!silent) setLoading(true, 'Menarik semua data dari Kibana… (mohon tunggu)');
 
   if (!silent){
-  FILTERS.resp.clear();
-  FILTERS.respdist.clear();
-  FILTERS.ip.clear();
-  FILTERS.viol.clear();
-  FILTERS.sig.clear();
-  FILTERS.violdist.clear();
-  FILTERS.url.clear();
+    FILTERS.resp.clear(); FILTERS.respdist.clear(); FILTERS.ip.clear();
+    FILTERS.viol.clear(); FILTERS.violtype.clear(); FILTERS.sig.clear(); FILTERS.violdist.clear(); FILTERS.url.clear();
   }
 
   const types = ['request_distribution','response_code','top_client_ip','top_url',
-                 'top_signatures','violations','top_violator_ip'];
+                 'top_signatures','violations','top_violator_ip','attack_analysis','raw_log_detail'];
   try{
     const results = await Promise.allSettled(types.map(t=>fetchData(t)));
     types.forEach((t,i)=>{
       if (results[i].status==='fulfilled') STATE[t] = results[i].value;
       else console.error(`Gagal ${t}:`, results[i].reason);
     });
+    if (!STATE.attack_analysis){
+      ensureAttackAnalysis();
+    }
     renderAll();
     const failed = types.map((t,i)=> results[i].status==='rejected'
       ? `${t}: ${(results[i].reason && results[i].reason.message) || 'error'}` : null).filter(Boolean);
-    setLastUpdate(!failed.length);
-    if (failed.length){
-      if (silent) console.warn('Auto-refresh sebagian gagal:', failed);
-      else alert('Sebagian data gagal:\n- ' + failed.join('\n- '));
-    }
+    const critical = failed.filter(f => !String(f).startsWith('attack_analysis:'));
+    setLastUpdate(!critical.length);
+    showNotice(critical);
+    if (failed.length) console.warn('Sebagian data gagal:', failed);
   }catch(e){
     setLastUpdate(false);
-    if (!silent) alert('Gagal refresh: '+e.message);
+    showNotice(['refresh: ' + e.message]);
   }finally{
     REFRESHING = false;
     if (!silent) setLoading(false);
@@ -1372,11 +1326,8 @@ const drBtn = document.getElementById('drBtn');
 const drPanel = document.getElementById('drPanel');
 drBtn.addEventListener('click', (e)=>{ e.stopPropagation(); drPanel.classList.toggle('hidden'); });
 document.addEventListener('click', (e)=>{
-  if (!document.getElementById('dateRangePicker').contains(e.target)){
-    drPanel.classList.add('hidden');
-  }
+  if (!document.getElementById('dateRangePicker').contains(e.target)) drPanel.classList.add('hidden');
 });
-
 document.getElementById('drQuickApply').addEventListener('click', ()=>{
   const num = parseInt(document.getElementById('drQuickNum').value, 10);
   const unit = document.getElementById('drQuickUnit').value;
@@ -1401,43 +1352,28 @@ document.getElementById('drQuickApply').addEventListener('click', ()=>{
   DR.unit=unit; DR.num=num;
   DR.rel = (mode === 'last') ? { num, unit } : null;
   updateDRLabel(); updateRangeInfo(); syncCustomInputsFromDR();
-  drPanel.classList.add('hidden');
-  refreshAll();
+  drPanel.classList.add('hidden'); refreshAll();
 });
-
 document.getElementById('drCustomApply').addEventListener('click', ()=>{
-  const start = readCustomInputs('Start');
-  const end = readCustomInputs('End');
-  const diffMs = end - start;
-  const diffDays = diffMs / (1000*60*60*24);
+  const start = readCustomInputs('Start'), end = readCustomInputs('End');
+  const diffDays = (end - start) / (1000*60*60*24);
   let unit = 'days';
   if (diffDays <= 1) unit = 'hours';
   else if (diffDays <= 60) unit = 'days';
   else if (diffDays <= 730) unit = 'months';
   else unit = 'years';
   if (!setCustom(start, end, null, unit)) return;
-  drPanel.classList.add('hidden');
-  refreshAll();
+  drPanel.classList.add('hidden'); refreshAll();
 });
-
 ['Start','End'].forEach(prefix=>{
   document.getElementById(`dr${prefix}Month`).addEventListener('change', ()=> updateDayOptions(prefix));
   document.getElementById(`dr${prefix}Year`).addEventListener('change', ()=> updateDayOptions(prefix));
 });
-
 document.getElementById('btnRefreshAll').addEventListener('click', refreshAll);
-document.getElementById('btnLoadRaw').addEventListener('click', async ()=>{
-  setLoading(true, 'Menarik raw log…');
-  try{
-    const data = await fetchData('raw_log_detail');
-    STATE.raw_log_detail = data;
-    renderRawTable();
-  }catch(e){ alert('Gagal: '+e.message); }
-  finally{ setLoading(false); }
-});
+document.getElementById('btnLoadRaw').addEventListener('click', ()=> refreshRaw());
 
 // ============================================================
-// AUTO REFRESH (realtime tiap 5 menit, tanpa overlay)
+// AUTO REFRESH
 // ============================================================
 function initAutoRefresh(){
   const btn = document.getElementById('btnAuto');
@@ -1448,13 +1384,18 @@ function initAutoRefresh(){
   };
   const start = ()=>{
     clearInterval(AUTO.timer);
-    if (AUTO.on) AUTO.timer = setInterval(()=>{
-      const modalOpen = !document.getElementById('modalOverlay').classList.contains('hidden');
-      if (!document.hidden && !modalOpen) refreshAll({silent:true});
-    }, AUTO.ms);
+    clearInterval(AUTO.rawTimer);
+    if (AUTO.on){
+      AUTO.timer = setInterval(()=>{
+        const modalOpen = !document.getElementById('modalOverlay').classList.contains('hidden');
+        if (!document.hidden && !modalOpen) refreshAll({silent:true});
+      }, AUTO.ms);
+      AUTO.rawTimer = setInterval(()=>{
+        if (!document.hidden && !REFRESHING) refreshRaw({silent:true});
+      }, AUTO.rawMs);
+    }
   };
   if (btn) btn.addEventListener('click', ()=>{ AUTO.on = !AUTO.on; paint(); start(); });
-  // kembali ke tab setelah lama -> segarkan
   document.addEventListener('visibilitychange', ()=>{
     if (!document.hidden && AUTO.on) refreshAll({silent:true});
   });
@@ -1471,8 +1412,6 @@ window.addEventListener('load', ()=>{
   initModal();
   bindSeeDataButtons();
   bindFilterToggles();
-
   initAutoRefresh();
-  refreshAll();      // selalu tarik langsung dari Kibana saat halaman dibuka
-
+  refreshAll();
 });
