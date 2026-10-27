@@ -1,5 +1,5 @@
 // ============================================================
-// WAF SOC DASHBOARD - APP LOGIC (v10)
+// WAF SOC DASHBOARD - APP LOGIC (v11: tema gelap/terang + anti-lag)
 // ============================================================
 
 const API = '';
@@ -7,6 +7,40 @@ const STATE = {};
 
 if (typeof ChartDataLabels !== 'undefined'){
   Chart.register(ChartDataLabels);
+}
+
+
+// ============================================================
+// THEME (GELAP / TERANG)
+// ============================================================
+const THEME_KEY = 'waf-theme';
+let LAST_FETCH_TS = Date.now();
+
+function getTheme(){
+  return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+}
+function rerenderChartsNoAnim(){
+  if (!STATE.request_distribution && !STATE.response_code) return;
+  CHART_ANIM = false;
+  try { renderAll(); } finally { CHART_ANIM = true; }
+}
+function applyTheme(t, persist){
+  const root = document.documentElement;
+  root.classList.add('theme-anim');
+  root.setAttribute('data-theme', t);
+  if (persist !== false){ try{ localStorage.setItem(THEME_KEY, t); }catch(e){} }
+  const btn = document.getElementById('btnTheme');
+  if (btn){
+    btn.title = t === 'light' ? 'Ganti ke mode gelap' : 'Ganti ke mode terang';
+    btn.setAttribute('aria-label', btn.title);
+  }
+  rerenderChartsNoAnim();
+  setTimeout(()=> root.classList.remove('theme-anim'), 400);
+}
+function initTheme(){
+  const btn = document.getElementById('btnTheme');
+  applyTheme(getTheme(), false);
+  if (btn) btn.addEventListener('click', ()=> applyTheme(getTheme() === 'light' ? 'dark' : 'light'));
 }
 
 const DR = {
@@ -441,9 +475,6 @@ function computeThreatLevel(){
 function renderPosture(){
   ensureAttackAnalysis();
   const t = computeThreatLevel();
-  const badge = document.getElementById('threatBadge');
-  badge.className = 'threat-badge ' + t.cls;
-  document.getElementById('threatLabel').textContent = t.status;
   gaugeChart('gaugeThreat', t.score, 100, t.status, t.color);
   const scoreEl = document.getElementById('threatScore');
   scoreEl.textContent = t.available ? t.score : '--';
@@ -532,7 +563,7 @@ function renderHeatmap(){
       const val = bucket[d][h];
       const ratio = maxVal ? (val / maxVal) : 0; 
       
-      let color = 'rgba(255,255,255,.04)';
+      let color = 'var(--cell-empty)';
       if (val > 0){
         if (ratio <= 0.25) {
           const op = 0.4 + (ratio/0.25)*0.6;
@@ -1303,7 +1334,9 @@ async function refreshAll(opts){
     if (!STATE.attack_analysis){
       ensureAttackAnalysis();
     }
-    renderAll();
+    CHART_ANIM = !silent;           // refresh senyap: tanpa animasi (tidak berkedip/lag)
+    try { renderAll(); } finally { CHART_ANIM = true; }
+    LAST_FETCH_TS = Date.now();
     const failed = types.map((t,i)=> results[i].status==='rejected'
       ? `${t}: ${(results[i].reason && results[i].reason.message) || 'error'}` : null).filter(Boolean);
     const critical = failed.filter(f => !String(f).startsWith('attack_analysis:'));
@@ -1397,8 +1430,19 @@ function initAutoRefresh(){
   };
   if (btn) btn.addEventListener('click', ()=>{ AUTO.on = !AUTO.on; paint(); start(); });
   document.addEventListener('visibilitychange', ()=>{
-    if (!document.hidden && AUTO.on) refreshAll({silent:true});
+    if (document.hidden) return;
+    // 1) Rapikan chart yang animasinya tertahan saat tab disembunyikan
+    settleCharts();
+    // 2) Tarik data ulang HANYA bila data sudah basi (> interval auto-refresh)
+    if (AUTO.on && !REFRESHING && (Date.now() - LAST_FETCH_TS) > AUTO.ms){
+      setTimeout(()=> refreshAll({silent:true}), 250);
+    }
   });
+  // Ukuran window berubah / zoom berubah -> gambar ulang rapi tanpa animasi
+  let _rz; window.addEventListener('resize', ()=>{ clearTimeout(_rz); _rz = setTimeout(settleCharts, 150); });
+  // Kembali fokus ke jendela / halaman dipulihkan dari cache browser
+  window.addEventListener('focus', settleCharts);
+  window.addEventListener('pageshow', settleCharts);
   paint(); start();
 }
 
@@ -1406,6 +1450,7 @@ function initAutoRefresh(){
 // INIT
 // ============================================================
 window.addEventListener('load', ()=>{
+  initTheme();
   fillStaticOptions();
   setQuick('last-8M');
   startClock();

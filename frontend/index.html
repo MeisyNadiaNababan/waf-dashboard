@@ -6,6 +6,11 @@
 <title>WAF Security Operations Center - BP Batam</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"/>
+<script>
+  // Set tema SEBELUM halaman tampil agar tidak berkedip
+  (function(){ var t='dark'; try{ t = localStorage.getItem('waf-theme')==='light' ? 'light' : 'dark'; }catch(e){}
+    document.documentElement.setAttribute('data-theme', t); })();
+</script>
 <link rel="stylesheet" href="css/style.css"/>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.2.0"></script>
@@ -64,13 +69,11 @@
       </div>
     </div>
 
-    <!-- THREAT BADGE -->
-    <div class="threat-badge" id="threatBadge">
-      <span class="pulse-dot"></span>
-      <span id="threatLabel">MEMUAT...</span>
-    </div>
-
     <div class="live-clock" id="liveClock">--:--:--</div>
+    <button id="btnTheme" class="btn-theme" title="Ganti mode gelap/terang" aria-label="Ganti mode gelap/terang">
+      <svg class="ic-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg class="ic-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg>
+    </button>
     <button id="btnAuto" class="btn-auto on" title="Segarkan otomatis tiap 5 menit">Auto 5m: ON</button>
     <button id="btnRefreshAll" class="btn-refresh">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3.51-7.12L21 8"/><path d="M21 3v5h-5"/></svg>
